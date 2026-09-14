@@ -5,7 +5,8 @@
 > and future maintainers are welcome across asset formats, rendering, physics,
 > racing, AI, tooling, documentation and platform support. See
 > **[Help Wanted — community roadmap #5](https://github.com/whoismept/OpenUG2/issues/5)**
-> and the [contribution areas below](#help-wanted).
+> and the [contribution areas below](#help-wanted), or join the
+> **[community Discord](https://discord.gg/AMnqueXe)**.
 
 An open, from-scratch reimplementation of the **Need for Speed: Underground 2**
 engine. It reads the *original* game's data files directly — no Wine, no box64,
@@ -272,6 +273,12 @@ reverse engineering, engine work, validation and platform coverage are too
 broad for one person to sustain alone. Start with
 **[Help Wanted — community roadmap #5](https://github.com/whoismept/OpenUG2/issues/5)**,
 or open a focused issue before beginning a large change.
+
+Join the **[OpenUG2 community Discord](https://discord.gg/AMnqueXe)** to follow
+development, share feedback, ask questions and coordinate contributions.
+Developers, testers, documentation writers and curious NFS fans are welcome;
+you do not need to write code to help. Keep reproducible bugs and proposed
+changes in GitHub issues so they remain easy to track.
 
 High-value contribution areas:
 
