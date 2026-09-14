@@ -57,6 +57,8 @@ typedef struct {
                                 Zero marks a conservative whole-object fallback:
                                 its texture may draw, but never make unrelated
                                 geometry cutout/blended/additive. */
+    unsigned char draw_mode; /* Optional wheel draw override. Parser callers use
+                               zero, retaining the draw caller's texture mode. */
     int      trim;    /* car BODY meshes only: 1 = plastic bumper/skirt (verified
                           real per-part name tokens, e.g. GOLF_KIT00_FRONT_BUMPER_A),
                           duller/broader specular than the metallic paint panels */
@@ -440,7 +442,7 @@ static int n2_mesh_category(const unsigned char *d, long beg, long end) {
 static void n2_add_pair(const unsigned char *d, N2Leaf vtx, N2Leaf idx,
                         int cat, N2Scene *scene,
                         int stride, int uvoff, int cull_skybox, uint32_t texkey,
-                        const float *mtx, long istart, long icount) {
+                        const float *mtx, long istart, long icount, unsigned char draw_mode) {
     const unsigned char *vb = d + vtx.off;
     int vlen = (int)vtx.size;
     int pad = n2_skip_filler(vb, vlen);
@@ -499,6 +501,7 @@ static void n2_add_pair(const unsigned char *d, N2Leaf vtx, N2Leaf idx,
 
     N2Mesh m; memset(&m, 0, sizeof(m));
     m.cat = cat; m.texkey = texkey; m.nverts = n;
+    m.draw_mode = draw_mode;
     m.verts = (float *)malloc((size_t)n * 5 * sizeof(float));
     /* World stream (24B stride) packs an RGBA8 prelight colour between position
        and UV (pos@0, colour@12, uv@16). Car stream (36B) has no such slot. */
@@ -1062,8 +1065,9 @@ static void n2_walk_meshes(const unsigned char *d, long beg, long end, N2Scene *
                     if (!sk) { sk = tk; if (n2_m102) n2_m102_rng_unres++; }
                     else if (n2_m102) n2_m102_rng_res++;
                     n2_add_pair(d, vtx[0], idx[0], cat, scene, 24, 16, cull,
-                                sk, objm,
-                                (long)sub[a].start, (long)sub[a].count);
+                                  sk, objm,
+                                  (long)sub[a].start, (long)sub[a].count,
+                                  (unsigned char)N2_DRAW_OPAQUE);
                     for (int m2 = before; m2 < scene->count; m2++) {
                         scene->meshes[m2].mat_exact = (unsigned char)exact;
                         scene->meshes[m2].scen = (unsigned char)sc;
@@ -1076,7 +1080,8 @@ static void n2_walk_meshes(const unsigned char *d, long beg, long end, N2Scene *
                 for (int k = 0; k < pairs; k++) {
                     int before = scene->count;
                     n2_add_pair(d, vtx[k], idx[k], cat, scene, 24, 16, cull,
-                                tk, objm, 0, -1);
+                                  tk, objm, 0, -1,
+                                  (unsigned char)N2_DRAW_OPAQUE);
                     for (int m2 = before; m2 < scene->count; m2++) {
                         scene->meshes[m2].mat_exact =
                             (unsigned char)exact_single_slot;
@@ -2005,7 +2010,8 @@ static void n2_walk_car(const unsigned char *d, long beg, long end, N2Scene *sce
                 for (int k = 0; k < nsub; k++) {
                     int before = scene->count;
                     n2_add_pair(d, vtx[0], idx[0], matcls[k], scene, 36, 28, 0,
-                                subtex[k], NULL, sub[k].start, sub[k].count);
+                                subtex[k], NULL, sub[k].start, sub[k].count,
+                                (unsigned char)N2_DRAW_OPAQUE);
                     if (scene->count > before) {
                         scene->meshes[before].trim = trim;
                         scene->meshes[before].car_material = submat[k];
@@ -2031,7 +2037,9 @@ static void n2_walk_car(const unsigned char *d, long beg, long end, N2Scene *sce
             } else {
                 for (int k = 0; k < pairs; k++) {   /* car parts have identity transforms */
                     int before = scene->count;
-                    n2_add_pair(d, vtx[k], idx[k], wholecat, scene, 36, 28, 0, tk, NULL, 0, -1);
+                    n2_add_pair(d, vtx[k], idx[k], wholecat, scene, 36, 28, 0,
+                                  tk, NULL, 0, -1,
+                                  (unsigned char)N2_DRAW_OPAQUE);
                     if (scene->count > before) {
                         scene->meshes[before].trim = trim;
                         scene->meshes[before].car_material = trust_cls && nsub && !matdiffer ? submat[0] : 0;
@@ -2178,6 +2186,7 @@ static int n2_rim_select_tier(N2Scene *s) {
  * same full vertex pool, so each gets the same transform. Call once per load. */
 static void n2_prepare_wheel_mesh(N2Mesh *m) {
     if (!m || !m->verts || m->nverts<=0) return;
+    m->car_mount=N2_MOUNT_WHEEL; /* includes selected aftermarket library slices */
     float bb[6]; n2_mesh_bbox(m,bb);
     float ymid=0.5f*(bb[2]+bb[3]);
     for (int v=0;v<m->nverts;v++) {
@@ -2186,8 +2195,169 @@ static void n2_prepare_wheel_mesh(N2Mesh *m) {
     }
 }
 
-/* Orient every material slice of a stock wheel together. Source vertices/UVs
- * and triangle coverage are retained; edge length is not a visibility rule.
+/* GPU-only tyre refinement: two midpoint subdivisions turn the usual 20-sided
+ * circumference into 80 sides. Interpolate along the axle-centred arc rather
+ * than its chord. Source geometry remains the physics/profile authority.
+ * On success the caller owns out->verts/idx; failure leaves out untouched. */
+static int n2_round_wheel_tyre(const N2Mesh *source, N2Mesh *out) {
+    if (!source || !out || source==out || source->car_mount!=N2_MOUNT_WHEEL ||
+        source->car_material!=N2_MAT_RUBBER || source->vcol ||
+        !source->verts || !source->idx || source->nverts<=0 ||
+        source->nidx<=0 || source->nidx%3) return 0;
+    N2Mesh work=*source;
+    int owned=0;
+    for (int pass=0;pass<2;pass++) {
+        if (work.nidx>INT32_MAX/4 || work.nverts>65535-work.nidx) {
+            if (owned) { free(work.verts); free(work.idx); }
+            return 0;
+        }
+        float *verts=(float *)malloc((size_t)(work.nverts+work.nidx)*5*sizeof(float));
+        uint16_t *idx=(uint16_t *)malloc((size_t)work.nidx*4*sizeof(uint16_t));
+        uint32_t *edges=(uint32_t *)malloc((size_t)work.nidx*sizeof(uint32_t));
+        uint16_t *mids=(uint16_t *)malloc((size_t)work.nidx*sizeof(uint16_t));
+        int ok=verts && idx && edges && mids, nv=work.nverts, ne=0, ni=0;
+        if (ok) memcpy(verts,work.verts,(size_t)work.nverts*5*sizeof(float));
+        for (int j=0;ok && j<work.nidx;j+=3) {
+            int mid[3];
+            for (int k=0;ok && k<3;k++) {
+                int a=work.idx[j+k], b=work.idx[j+(k+1)%3];
+                if (a>=work.nverts || b>=work.nverts) { ok=0; break; }
+                uint32_t key=((uint32_t)(a<b?a:b)<<16)|(uint32_t)(a<b?b:a);
+                /* ponytail: linear edge reuse for low-poly tyres; hash edges
+                 * if denser source tyres make load time measurable. */
+                int e=0; while(e<ne && edges[e]!=key) e++;
+                if (e==ne) {
+                    const float *p=work.verts+5*a, *q=work.verts+5*b;
+                    float ra=hypotf(p[0],p[2]), rb=hypotf(q[0],q[2]);
+                    if (!(ra>1e-6f && rb>1e-6f)) { ok=0; break; }
+                    float dot=(p[0]/ra)*(q[0]/rb)+(p[2]/ra)*(q[2]/rb);
+                    if (!(dot>0.5f)) { ok=0; break; } /* ambiguous/long arcs */
+                    float x=p[0]/ra+q[0]/rb, z=p[2]/ra+q[2]/rb;
+                    float scale=(ra+rb)*0.5f/hypotf(x,z), *v=verts+5*nv;
+                    for (int c=0;c<5;c++) v[c]=(p[c]+q[c])*0.5f;
+                    v[0]=x*scale; v[2]=z*scale;
+                    for (int c=0;c<5;c++) if (!isfinite(v[c])) ok=0;
+                    edges[ne]=key; mids[ne++]=(uint16_t)nv++;
+                }
+                mid[k]=mids[e];
+            }
+            if (!ok) break;
+            int a=work.idx[j], b=work.idx[j+1], c=work.idx[j+2];
+            const int tri[]={a,mid[0],mid[2], mid[0],b,mid[1],
+                             mid[2],mid[1],c, mid[0],mid[1],mid[2]};
+            for (int k=0;k<12;k++) idx[ni++]=(uint16_t)tri[k];
+        }
+        free(edges); free(mids);
+        if (owned) { free(work.verts); free(work.idx); }
+        if (!ok) { free(verts); free(idx); return 0; }
+        work.verts=verts; work.idx=idx; work.nverts=nv; work.nidx=ni; owned=1;
+    }
+    *out=work;
+    return 1;
+}
+
+/* Replace only the broad inboard backing quad with an open annulus. Keep any
+ * authored barrel triangles in the same material slice. The hole follows the
+ * matching tyre's inner edge; missing attribution/ambiguous geometry stays as-is.
+ * This is a presentation replacement, not recovered retail geometry. Call after
+ * wheel orientation, before upload; the original vertex pool/bounds stay intact. */
+static int n2_open_wheel_backing(N2Scene *s, int mi) {
+    enum { SEGMENTS = 64 };
+    if (!s || mi<0 || mi>=s->count) return 0;
+    N2Mesh *m=s->meshes+mi;
+    if (m->car_material!=N2_MAT_INTERIOR || !m->verts || !m->idx ||
+        m->vcol || m->nverts<=0 || m->nverts>65535-2*SEGMENTS ||
+        m->nidx<6 || m->nidx>INT32_MAX-6*SEGMENTS || m->nidx%3) return 0;
+    float inner=1e30f, outer=0;
+    for (int i=0;i<s->count;i++) {
+        const N2Mesh *t=s->meshes+i;
+        if (t->tierid!=m->tierid || t->car_source!=m->car_source ||
+            t->car_material!=N2_MAT_RUBBER) continue;
+        if (!t->verts || !t->idx) return 0;
+        for (int j=0;j<t->nidx;j++) {
+            if (t->idx[j]>=t->nverts) return 0;
+            const float *v=t->verts+5*t->idx[j];
+            float r=hypotf(v[0],v[2]);
+            if (!isfinite(r)) return 0;
+            inner=fminf(inner,r); outer=fmaxf(outer,r);
+        }
+    }
+    if (!(inner>0 && inner<outer)) return 0;
+    float bb[6]; n2_mesh_bbox(m,bb);
+    float eps=outer*0.001f;
+    int face[2], nf=0;
+    for (int j=0;j<m->nidx;j+=3) {
+        for (int k=0;k<3;k++) if (m->idx[j+k]>=m->nverts) return 0;
+        const float *a=m->verts+5*m->idx[j], *b=m->verts+5*m->idx[j+1],
+                    *c=m->verts+5*m->idx[j+2];
+        float area=(b[0]-a[0])*(c[2]-a[2])-(b[2]-a[2])*(c[0]-a[0]);
+        if (fabsf(a[1]-b[1])>eps || fabsf(a[1]-c[1])>eps ||
+            a[1]>bb[2]+0.05f*(bb[3]-bb[2]) || fabsf(area)<outer*outer) continue;
+        if (nf==2) return 0;
+        face[nf++]=j;
+    }
+    if (nf!=2) return 0;
+    float lo[2]={1e30f,1e30f}, hi[2]={-1e30f,-1e30f};
+    const float *a=m->verts+5*m->idx[face[0]], *b=m->verts+5*m->idx[face[0]+1],
+                *c=m->verts+5*m->idx[face[0]+2];
+    float winding=(b[0]-a[0])*(c[2]-a[2])-(b[2]-a[2])*(c[0]-a[0]);
+    for (int f=0;f<2;f++) for (int k=0;k<3;k++) {
+        const float *v=m->verts+5*m->idx[face[f]+k];
+        if (fabsf(v[1]-a[1])>eps) return 0;
+        for (int q=0;q<2;q++) { lo[q]=fminf(lo[q],v[q*2]); hi[q]=fmaxf(hi[q],v[q*2]); }
+    }
+    /* Require a centred rectangle, rather than cutting arbitrary large faces. */
+    for (int q=0;q<2;q++)
+        if (fabsf(lo[q]+hi[q])>outer*0.02f || hi[q]-lo[q]<1.8f*outer) return 0;
+    float uv[4][2]; int corners=0, facecorners[2]={0,0};
+    for (int f=0;f<2;f++) for (int k=0;k<3;k++) {
+        const float *v=m->verts+5*m->idx[face[f]+k];
+        int x=fabsf(v[0]-lo[0])<=eps?0:fabsf(v[0]-hi[0])<=eps?1:-1;
+        int z=fabsf(v[2]-lo[1])<=eps?0:fabsf(v[2]-hi[1])<=eps?1:-1;
+        if (x<0 || z<0) return 0;
+        int corner=x+2*z;
+        if ((corners&(1<<corner)) &&
+            (fabsf(uv[corner][0]-v[3])>1e-5f || fabsf(uv[corner][1]-v[4])>1e-5f)) return 0;
+        uv[corner][0]=v[3]; uv[corner][1]=v[4]; corners|=1<<corner;
+        facecorners[f]|=1<<corner;
+    }
+    int shared=facecorners[0]&facecorners[1];
+    if (corners!=15 || (shared!=6 && shared!=9)) return 0;
+    outer=fminf(outer,fminf(fminf(-lo[0],hi[0]),fminf(-lo[1],hi[1])));
+    /* The polygon's edges, not just its vertices, must clear the tyre opening. */
+    inner/=cosf(3.14159265f/SEGMENTS);
+    if (inner>=outer) return 0;
+    int nv=m->nverts+2*SEGMENTS, ni=m->nidx-6+6*SEGMENTS;
+    float *verts=(float *)malloc((size_t)nv*5*sizeof(float));
+    uint16_t *idx=(uint16_t *)malloc((size_t)ni*sizeof(uint16_t));
+    if (!verts || !idx) { free(verts); free(idx); return 0; }
+    memcpy(verts,m->verts,(size_t)m->nverts*5*sizeof(float));
+    for (int k=0;k<SEGMENTS;k++) for (int ring=0;ring<2;ring++) {
+        float angle=2*3.14159265f*k/SEGMENTS, r=ring?outer:inner;
+        float *v=verts+5*(m->nverts+2*k+ring);
+        v[0]=r*cosf(angle); v[1]=a[1]; v[2]=r*sinf(angle);
+        float u=(v[0]-lo[0])/(hi[0]-lo[0]), w=(v[2]-lo[1])/(hi[1]-lo[1]);
+        for (int q=0;q<2;q++)
+            v[3+q]=(1-w)*((1-u)*uv[0][q]+u*uv[1][q])+w*((1-u)*uv[2][q]+u*uv[3][q]);
+    }
+    int n=0;
+    for (int j=0;j<m->nidx;j+=3) if (j!=face[0] && j!=face[1])
+        for (int k=0;k<3;k++) idx[n++]=m->idx[j+k];
+    for (int k=0;k<SEGMENTS;k++) {
+        int p=m->nverts+2*k, q=m->nverts+2*((k+1)%SEGMENTS);
+        const int tri[]={p,p+1,q+1,p,q+1,q};
+        for (int j=0;j<6;j+=3) {
+            idx[n++]=(uint16_t)tri[j];
+            idx[n++]=(uint16_t)tri[j+(winding>0?1:2)];
+            idx[n++]=(uint16_t)tri[j+(winding>0?2:1)];
+        }
+    }
+    free(m->verts); free(m->idx);
+    m->verts=verts; m->idx=idx; m->nverts=nv; m->nidx=ni;
+    return 1;
+}
+
+/* Orient every material slice of a stock wheel together, then open its backing.
  * Returns a representative of the stock tier (all its slices must be drawn).
  * Call once per fresh car load, including a kit reload. */
 static int n2_car_prepare_wheels(N2Scene *s) {
@@ -2198,6 +2368,8 @@ static int n2_car_prepare_wheels(N2Scene *s) {
         n2_prepare_wheel_mesh(m);
         if (stock<0 || m->nidx>s->meshes[stock].nidx) stock=i;
     }
+    for (int i=0;i<s->count;i++) if (s->meshes[i].car_mount==N2_MOUNT_WHEEL)
+        n2_open_wheel_backing(s,i);
     return stock;
 }
 
