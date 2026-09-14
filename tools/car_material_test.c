@@ -1027,7 +1027,127 @@ static void exhaust_attachment_test(void) {
     }
 }
 
+static void wheel_tyre_rounding_test(void) {
+    printf("\n  GPU tyre arcs keep source physics geometry unchanged\n");
+    const float angle=3.14159265f/10;
+    float verts[]={1,-.2f,0,0,0, cosf(angle),-.2f,sinf(angle),1,0,
+                   cosf(angle),.2f,sinf(angle),1,1, 1,.2f,0,0,1};
+    uint16_t idx[]={0,1,2,0,2,3};
+    N2Mesh source={0}, rounded={0};
+    source.verts=verts; source.idx=idx; source.nverts=4; source.nidx=6;
+    source.car_mount=N2_MOUNT_WHEEL; source.car_material=N2_MAT_RUBBER;
+    float saved[20],bb[6],after[6];memcpy(saved,verts,sizeof saved);n2_mesh_bbox(&source,bb);
+    chk("tyre arc refinement succeeds",n2_round_wheel_tyre(&source,&rounded));
+    if(!rounded.verts)return;
+    chk("two subdivisions share edge midpoints",rounded.nidx==96 && rounded.nverts==25);
+    int arc=1,uv=1,winding=1;
+    for(int j=0;j<rounded.nverts;j++){
+        const float *v=rounded.verts+5*j;
+        arc &= fabsf(hypotf(v[0],v[2])-1)<1e-6f;
+        uv &= fabsf(atan2f(v[2],v[0])/angle-v[3])<1e-5f &&
+              fabsf((v[1]+.2f)/.4f-v[4])<1e-5f;
+    }
+    for(int j=0;j<rounded.nidx;j+=3){
+        const float *a=rounded.verts+5*rounded.idx[j],*b=rounded.verts+5*rounded.idx[j+1],
+                    *c=rounded.verts+5*rounded.idx[j+2];
+        float nx=(b[1]-a[1])*(c[2]-a[2])-(b[2]-a[2])*(c[1]-a[1]);
+        float nz=(b[0]-a[0])*(c[1]-a[1])-(b[1]-a[1])*(c[0]-a[0]);
+        winding &= nx*a[0]+nz*a[2]<0;
+        for(int k=0;k<3;k++){
+            const float *p=rounded.verts+5*rounded.idx[j+k],*q=rounded.verts+5*rounded.idx[j+(k+1)%3];
+            arc &= fabsf(atan2f(p[0]*q[2]-p[2]*q[0],p[0]*q[0]+p[2]*q[2]))<=angle*.25f+1e-6f;
+        }
+    }
+    chk("rounded edges follow the radius with quarter-size angular steps",arc);
+    chk("tyre width, UV seams and winding are retained",uv && winding);
+    n2_mesh_bbox(&source,after);
+    chk("source vertices, indices and physics bounds are unchanged",
+        !memcmp(saved,verts,sizeof saved) && !memcmp(bb,after,sizeof bb) &&
+        source.nidx==6 && source.nverts==4 && source.idx==idx && source.verts==verts);
+    free(rounded.verts);free(rounded.idx);memset(&rounded,0,sizeof rounded);
+    source.car_material=N2_MAT_INTERIOR;
+    chk("backing and brake opening are not subdivided",!n2_round_wheel_tyre(&source,&rounded));
+    source.car_material=N2_MAT_RUBBER;source.car_mount=N2_MOUNT_BODY;
+    chk("non-wheel rubber is unchanged",!n2_round_wheel_tyre(&source,&rounded));
+    source.car_mount=N2_MOUNT_WHEEL;idx[0]=99;
+    chk("invalid indices fall back without output allocation",!n2_round_wheel_tyre(&source,&rounded) && !rounded.verts);
+    idx[0]=0;verts[0]=0;
+    chk("axis-crossing geometry is preserved",!n2_round_wheel_tyre(&source,&rounded));
+}
+
+static void wheel_backing_opening_test(void) {
+    printf("\n  Wheel backing opening preserves the authored barrel\n");
+    Buf f={.n=0};
+    const float p[][3]={{1,-.2f,0},{.6f,.2f,0},{0,.2f,.6f},{0,-.2f,1},
+        {-1,.2f,-1},{1,.2f,-1},{1,.2f,1},{-1,.2f,1},
+        {.6f,.1f,0},{.6f,.2f,0},{0,.1f,.6f}};
+    const uint16_t indices[]={0,1,2,0,2,3,4,5,6,4,6,7,8,9,10};
+    const uint32_t tex[]={0x12345678}, mat[]={N2_MAT_RUBBER,N2_MAT_INTERIOR};
+    const SubSpec sub[]={{6,0,0,0},{9,0,1,6}};
+    object(&f,"TEST_TIRE_FRONT_A",tex,1,mat,2,sub,2,p,11,indices,15);
+    N2Scene s;
+    n2_load_car(f.b,f.n,&s,tex,1,NULL);
+    chk("backing fixture retains tyre and interior slices",s.count==2);
+    if(s.count!=2){n2_free_scene(&s);return;}
+    for(int i=0;i<s.count;i++) n2_prepare_wheel_mesh(s.meshes+i);
+    N2Mesh *m=s.meshes+1;
+    float original[55], tyre[55], before[6], after[6];
+    memcpy(original,m->verts,sizeof original);memcpy(tyre,s.meshes[0].verts,sizeof tyre);
+    n2_mesh_bbox(m,before);
+    float *oldverts=m->verts; uint16_t *oldidx=m->idx;
+    s.meshes[0].car_material=0;
+    chk("unknown tyre material leaves backing untouched",!n2_open_wheel_backing(&s,1) &&
+        m->verts==oldverts && m->idx==oldidx);
+    s.meshes[0].car_material=N2_MAT_RUBBER;
+    s.meshes[0].tierid++;
+    chk("another wheel tier cannot supply the opening",!n2_open_wheel_backing(&s,1));
+    s.meshes[0].tierid--;
+    m->verts[4*5+1]+=.1f;
+    chk("nonplanar backing is preserved",!n2_open_wheel_backing(&s,1));
+    memcpy(m->verts,original,sizeof original);
+    uint16_t saved_corner=m->idx[4];m->idx[4]=m->idx[1];
+    chk("overlapping triangles are not treated as a backing quad",!n2_open_wheel_backing(&s,1));
+    m->idx[4]=saved_corner;
+    int oldcount=m->nverts;m->nverts=65535;
+    chk("u16 vertex limit leaves backing untouched",!n2_open_wheel_backing(&s,1));
+    m->nverts=oldcount;
+    chk("recognised rear quad becomes an open ring",n2_open_wheel_backing(&s,1)==1);
+    if(m->nverts==oldcount){n2_free_scene(&s);return;}
+    n2_mesh_bbox(m,after);
+    chk("wheel bounds and original vertex/UV pool are unchanged",
+        !memcmp(before,after,sizeof before) && !memcmp(original,m->verts,sizeof original));
+    chk("tyre geometry and texture/material attribution are unchanged",
+        !memcmp(tyre,s.meshes[0].verts,sizeof tyre) && m->texkey==tex[0] &&
+        m->car_material==N2_MAT_INTERIOR);
+    chk("existing barrel triangle survives exactly",m->nidx>3 &&
+        !memcmp(m->idx,indices+12,3*sizeof(uint16_t)));
+    int clear=1,plane=1,winding=1;
+    for(int j=3;j<m->nidx;j+=3){
+        const float *a=m->verts+5*m->idx[j], *b=m->verts+5*m->idx[j+1],
+                    *c=m->verts+5*m->idx[j+2];
+        winding &= (b[0]-a[0])*(c[2]-a[2])-(b[2]-a[2])*(c[0]-a[0])<0;
+        for(int k=0;k<3;k++){
+            const float *v=m->verts+5*m->idx[j+k],*w=m->verts+5*m->idx[j+(k+1)%3];
+            float dx=w[0]-v[0], dz=w[2]-v[2];
+            float t=fmaxf(0,fminf(1,-(v[0]*dx+v[2]*dz)/(dx*dx+dz*dz)));
+            clear &= hypotf(v[0]+t*dx,v[2]+t*dz)>=.6f-1e-5f;
+            plane &= fabsf(v[1]+.2f)<1e-6f;
+        }
+    }
+    chk("every ring edge clears the measured tyre opening",clear);
+    chk("ring stays on the recessed backing plane with original winding",plane && winding);
+    oldverts=m->verts;oldidx=m->idx;
+    chk("opening is idempotent",!n2_open_wheel_backing(&s,1) && m->verts==oldverts && m->idx==oldidx);
+    n2_free_scene(&s);
+    n2_load_car(f.b,f.n,&s,tex,1,NULL);
+    int stock=n2_car_prepare_wheels(&s);
+    chk("stock load/reload preparation opens the backing",stock>=0 && s.meshes[1].nverts>11);
+    n2_free_scene(&s);
+}
+
 int main(void) {
+    wheel_tyre_rounding_test();
+    wheel_backing_opening_test();
     exhaust_attachment_test();
     wheel_material_identity_test();
     car_texture_alpha_test();

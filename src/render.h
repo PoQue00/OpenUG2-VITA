@@ -4,8 +4,7 @@
  * main.c only binds/draws through GpuMesh + the RProg uniform handles.
  *
  * Also the single home of the GL headers: desktop legacy GL 2.1 + GLSL 120, or
- * OpenGL ES 2.0 + GLSL 100 with -DN2_GLES — every module includes GL via here.
- */
+ * OpenGL ES 2.0 + GLSL 100 with -DN2_GLES — every module includes GL via here. */
 #ifndef OPENUG2_RENDER_H
 #define OPENUG2_RENDER_H
 
@@ -24,7 +23,12 @@
 #include "nfsu2.h"
 
 /* per-mesh GPU buffers + computed normals */
-typedef struct { GLuint vbo, nbo, ibo; int nidx, cat, trim; uint32_t texkey, car_material; } GpuMesh;
+typedef struct {
+    GLuint vbo, nbo, ibo;
+    int nidx, cat, trim;
+    uint32_t texkey, car_material;
+    unsigned char draw_mode;  /* Optional override; zero uses the caller's mode. */
+} GpuMesh;
 
 /* ---- static-world batching: meshes merged per (256m grid cell, texture) ----
  * One interleaved VBO per batch kills the per-mesh bind/attrib overhead;

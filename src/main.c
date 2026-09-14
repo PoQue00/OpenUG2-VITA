@@ -199,6 +199,7 @@ static int load_rim_style(const unsigned char *wldata, long wllen,
     for (int i=0;i<n;i++) triangles+=lib->meshes[i].nidx/3;
     printf("  rim tier: %u, %d slices, %d source triangles per hub\n",
            lib->meshes[0].tierid,n,triangles);
+    for (int i=0;i<n;i++) n2_open_wheel_backing(lib,i);
     /* Fit the selected library size to THIS car's wheel. Scale every rim
        submesh (they share the origin) to the car's stock-wheel radius fitR,
        which is measured from

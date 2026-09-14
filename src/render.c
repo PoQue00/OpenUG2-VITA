@@ -420,6 +420,8 @@ GpuMesh *upload_scene(N2Scene *s) {
     GpuMesh *gm = (GpuMesh *)calloc(s->count, sizeof(GpuMesh));
     for (int i = 0; i < s->count; i++) {
         N2Mesh *m = &s->meshes[i];
+        N2Mesh rounded={0};
+        if (n2_round_wheel_tyre(m,&rounded)) m=&rounded;
         float *nor = (float *)calloc(m->nverts * 3, sizeof(float));
         mesh_normals(m, nor);
         glGenBuffers(1,&gm[i].vbo); glBindBuffer(GL_ARRAY_BUFFER,gm[i].vbo);
@@ -429,9 +431,10 @@ GpuMesh *upload_scene(N2Scene *s) {
         glGenBuffers(1,&gm[i].ibo); glBindBuffer(GL_ELEMENT_ARRAY_BUFFER,gm[i].ibo);
         glBufferData(GL_ELEMENT_ARRAY_BUFFER, m->nidx*sizeof(uint16_t), m->idx, GL_STATIC_DRAW);
         gm[i].nidx = m->nidx; gm[i].cat = m->cat; gm[i].texkey = m->texkey;
-        gm[i].trim = m->trim;
+        gm[i].trim = m->trim; gm[i].draw_mode = m->draw_mode;
         gm[i].car_material = m->car_material;
         free(nor);
+        free(rounded.verts); free(rounded.idx);
     }
     return gm;
 }
@@ -951,7 +954,9 @@ void render_wheel_mesh(const RProg *r, GpuMesh *mesh, GLuint texture, int mode) 
     glGetIntegerv(GL_BLEND_SRC_ALPHA,&srca);glGetIntegerv(GL_BLEND_DST_ALPHA,&dsta);
     GLboolean blend=glIsEnabled(GL_BLEND),depth=glIsEnabled(GL_DEPTH_TEST),mask;
     glGetBooleanv(GL_DEPTH_WRITEMASK,&mask);
-    int cut=texture && mode==N2_DRAW_CUTOUT, translucent=texture && mode==N2_DRAW_BLEND;
+    /* Zero keeps the texture mode supplied by the caller. */
+    unsigned char amode = mesh->draw_mode ? mesh->draw_mode : (unsigned char)mode;
+    int cut=texture && amode==N2_DRAW_CUTOUT, translucent=texture && amode==N2_DRAW_BLEND;
     glBindTexture(GL_TEXTURE_2D,texture);
     glUniform1f(r->uUseTex,texture?1.0f:0.0f);
     glUniform1f(r->uAlphaTest,cut?1.0f:0.0f);
