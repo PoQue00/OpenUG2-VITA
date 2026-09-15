@@ -32,6 +32,33 @@ extern "C" void dbgui_event(const union SDL_Event *e) {
 extern "C" int dbgui_want_mouse(void)    { return ImGui::GetIO().WantCaptureMouse; }
 extern "C" int dbgui_want_keyboard(void) { return ImGui::GetIO().WantCaptureKeyboard; }
 
+static bool shop_tab(const char *label, ImVec4 colour) {
+    ImGui::PushStyleColor(ImGuiCol_Text, colour);
+    bool open=ImGui::BeginTabItem(label);
+    ImGui::PopStyleColor();
+    return open;
+}
+
+static void part_selector(int p) {
+    if (!g_dbg.mod_parts) return;
+    const N2PartMenu *menu=g_dbg.mod_parts+p;
+    const char *label="Stock / none";
+    for(int i=0;i<menu->count;i++)
+        if(menu->options[i].value==g_dbg.mod_current.parts[p])label=menu->options[i].label;
+    ImGui::BeginDisabled(menu->count<2 || g_dbg.kmh>1.0f || g_dbg.kmh<-1.0f);
+    if(ImGui::BeginCombo(n2_part_labels[p],menu->count<2?"Not available for this car":label)) {
+        for(int i=0;i<menu->count;i++) {
+            bool selected=menu->options[i].value==g_dbg.mod_current.parts[p];
+            if(ImGui::Selectable(menu->options[i].label,selected)) {
+                g_dbg.mod_request_slot=p;g_dbg.mod_request_value=menu->options[i].value;
+            }
+            if(selected)ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::EndDisabled();
+}
+
 extern "C" void dbgui_frame(void) {
     ImGui_ImplOpenGL2_NewFrame();
     ImGui_ImplSDL2_NewFrame();
@@ -49,39 +76,87 @@ extern "C" void dbgui_frame(void) {
     if (ImGui::BeginTabBar("MasterInspectorTabs")) {
 
     /* ---- Tab 1: Vehicle & Wheels ---- */
-    if (ImGui::BeginTabItem("Vehicle & Wheels")) {
-        if (ImGui::CollapsingHeader("Vehicle Controls", ImGuiTreeNodeFlags_DefaultOpen)) {
-            /* body paint -> u_PaintColor (uColor) when override is on; the draw
-               loop reads g_dbg.paint for BODY/MISC meshes, so this repaints live. */
-            ImGui::Checkbox("custom paint (override per-car colour)", (bool *)&g_dbg.paint_override);
-            ImGui::ColorEdit3("body paint (u_PaintColor)", g_dbg.paint);
-            if (ImGui::Button("Red"))    { g_dbg.paint_override=1; g_dbg.paint[0]=0.70f; g_dbg.paint[1]=0.05f; g_dbg.paint[2]=0.05f; } ImGui::SameLine();
-            if (ImGui::Button("Blue"))   { g_dbg.paint_override=1; g_dbg.paint[0]=0.05f; g_dbg.paint[1]=0.10f; g_dbg.paint[2]=0.60f; } ImGui::SameLine();
-            if (ImGui::Button("Black"))  { g_dbg.paint_override=1; g_dbg.paint[0]=0.02f; g_dbg.paint[1]=0.02f; g_dbg.paint[2]=0.03f; } ImGui::SameLine();
-            if (ImGui::Button("Silver")) { g_dbg.paint_override=1; g_dbg.paint[0]=0.60f; g_dbg.paint[1]=0.62f; g_dbg.paint[2]=0.66f; }
-            ImGui::TextDisabled("body kit: K cycles authored KIT00..KITnn (see console)");
+    if (ImGui::BeginTabItem("Modification")) {
+        if (g_dbg.car_list && g_dbg.n_cars > 0) {
+            if (ImGui::BeginCombo("Car", g_dbg.car_name)) {
+                for (int i=0;i<g_dbg.n_cars;i++) {
+                    bool selected=i==g_dbg.sel_car;
+                    if (ImGui::Selectable(g_dbg.car_list[i],selected) && !selected) g_dbg.want_car=i;
+                    if (selected) ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::TextDisabled("Changing car restarts the session with its own available kits.");
         }
-        if (ImGui::CollapsingHeader("Wheel Stance (per-car, metres)", ImGuiTreeNodeFlags_DefaultOpen)) {
-            /* Absolute stance for the active car -- edits apply next frame, since
-               the wheel transforms are rebuilt from g_dbg.wheel every frame. */
-            ImGui::SliderFloat("front axle Z", &g_dbg.wheel.front_axle,  0.0f, 2.5f, "%.3f m");
-            ImGui::SliderFloat("rear axle Z",  &g_dbg.wheel.rear_axle,  -2.5f, 0.0f, "%.3f m");
-            ImGui::SliderFloat("front track",  &g_dbg.wheel.front_track, 0.8f, 2.2f, "%.3f m");
-            ImGui::SliderFloat("rear track",   &g_dbg.wheel.rear_track,  0.8f, 2.2f, "%.3f m");
-            ImGui::SliderFloat("ride height Y",&g_dbg.wheel.ride_y,     -0.5f, 0.5f, "%.3f m");
-            ImGui::Text("wheelbase %.3f m", g_dbg.wheel.front_axle - g_dbg.wheel.rear_axle);
-            ImGui::SliderFloat("radius/scale", &g_dbg.wheel_scale, 0.3f, 2.0f);
-            ImGui::Text("radius %.3f m   %.0f RPM   steer %+.1f deg",
-                        g_dbg.wheel_radius, g_dbg.wheel_rpm, g_dbg.steer_deg);
+        ImGui::TextWrapped("Shop preview: changes are free for testing. Career purchases and shop entry restrictions are not active yet.");
+        if (ImGui::BeginTabBar("ShopTabs")) {
+        if (shop_tab("Body", ImVec4(0.35f, 0.9f, 0.45f, 1))) {
+            ImGui::TextUnformatted("Green / Body Shop");
+            ImGui::TextDisabled("Stop the car to replace parts.");
+            for (int p=0; p<N2_PART_COUNT; p++)
+                if (p!=N2_PART_AUDIO && p!=N2_PART_ENGINE) part_selector(p);
+        if (ImGui::CollapsingHeader("Body kit preset")) {
+            ImGui::Text("%s: %d available kits (including stock)",g_dbg.car_name,g_dbg.body_kit_count);
+            bool moving=g_dbg.kmh>1.0f || g_dbg.kmh<-1.0f;
+            ImGui::BeginDisabled(moving || g_dbg.body_kit_count<2);
+            char label[32];
+            snprintf(label,sizeof label,"KIT%02d%s",g_dbg.body_kit_current,
+                     g_dbg.body_kit_current==0?" (stock)":"");
+            if (ImGui::BeginCombo("Installed kit",label)) {
+                for(int i=0;i<g_dbg.body_kit_count;i++) {
+                    int kit=g_dbg.body_kit_ids[i];
+                    snprintf(label,sizeof label,"KIT%02d%s",kit,kit==0?" (stock)":"");
+                    if(ImGui::Selectable(label,kit==g_dbg.body_kit_current))g_dbg.body_kit_request=kit;
+                    if(kit==g_dbg.body_kit_current)ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::EndDisabled();
+            if(g_dbg.body_kit_count==1)ImGui::TextDisabled("This car has no optional body kits in its archive.");
+            ImGui::TextDisabled("Stop the car to change kits. K cycles available kits.");
+            if(g_dbg.body_kit_status[0])ImGui::TextWrapped("%s",g_dbg.body_kit_status);
         }
-        if (ImGui::CollapsingHeader("Rim: brand / style / paint", ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (ImGui::CollapsingHeader("Rims", ImGuiTreeNodeFlags_DefaultOpen)) {
             if (g_dbg.wheel_brands && g_dbg.wheel_brand_n > 0) {
                 static const char *brands[32];
                 int nb = g_dbg.wheel_brand_n < 32 ? g_dbg.wheel_brand_n : 32;
                 for (int i = 0; i < nb; i++) brands[i] = g_dbg.wheel_brands[i];
                 if (ImGui::Combo("wheel brand", &g_dbg.wheel_brand, brands, nb)) g_dbg.wheel_reload = 1;
                 if (ImGui::SliderInt("wheel style", &g_dbg.wheel_style, 1, 8)) g_dbg.wheel_reload = 1;
+                if (g_dbg.wheel_load_failed)
+                    ImGui::TextWrapped("Could not load that wheel. Current wheels kept.");
             } else ImGui::TextDisabled("wheel library not loaded");
+        }
+            ImGui::TextWrapped("Not yet supported: mirrors, carbon fibre conversion, wide body kits, rim sizing.");
+            ImGui::EndTabItem();
+        }
+        if (shop_tab("Specialties", ImVec4(1, 0.85f, 0.3f, 1))) {
+            ImGui::TextUnformatted("Yellow / Car Specialties Shop");
+            part_selector(N2_PART_AUDIO);
+        if (ImGui::CollapsingHeader("Neon Underglow", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::Checkbox("neon on", (bool *)&g_dbg.neon_on);
+            ImGui::ColorEdit3("neon colour", g_dbg.neon_col);
+            ImGui::SliderFloat("intensity", &g_dbg.neon_str, 0.0f, 1.5f);
+        }
+            ImGui::TextWrapped("Not yet supported: custom gauges, doors, split hoods, hydraulics, light colours, engine/trunk neon, nitrous purge, spinners, window tint.");
+            ImGui::EndTabItem();
+        }
+        if (shop_tab("Graphics", ImVec4(1, 0.4f, 0.4f, 1))) {
+            ImGui::TextUnformatted("Red / Graphics Shop");
+        if (ImGui::CollapsingHeader("Body paint", ImGuiTreeNodeFlags_DefaultOpen)) {
+            /* body paint -> u_PaintColor (uColor) when override is on; the draw
+               loop reads g_dbg.paint for BODY/MISC meshes, so this repaints live. */
+            ImGui::Checkbox("custom paint (override per-car colour)", (bool *)&g_dbg.paint_override);
+            ImGui::ColorEdit3("Body colour", g_dbg.paint);
+            if (ImGui::Button("Red"))    { g_dbg.paint_override=1; g_dbg.paint[0]=0.70f; g_dbg.paint[1]=0.05f; g_dbg.paint[2]=0.05f; } ImGui::SameLine();
+            if (ImGui::Button("Blue"))   { g_dbg.paint_override=1; g_dbg.paint[0]=0.05f; g_dbg.paint[1]=0.10f; g_dbg.paint[2]=0.60f; } ImGui::SameLine();
+            if (ImGui::Button("Black"))  { g_dbg.paint_override=1; g_dbg.paint[0]=0.02f; g_dbg.paint[1]=0.02f; g_dbg.paint[2]=0.03f; } ImGui::SameLine();
+            if (ImGui::Button("Silver")) { g_dbg.paint_override=1; g_dbg.paint[0]=0.60f; g_dbg.paint[1]=0.62f; g_dbg.paint[2]=0.66f; }
+            ImGui::SliderFloat("Clear coat", &g_dbg.body_clearcoat, 0.0f, 1.0f);
+            ImGui::SliderFloat("Paint highlight", &g_dbg.body_spec, 0.05f, 1.0f);
+            ImGui::SliderFloat("Paint reflection", &g_dbg.body_env, 0.0f, 2.0f, "%.2fx");
+        }
+        if (ImGui::CollapsingHeader("Rim paint", ImGuiTreeNodeFlags_DefaultOpen)) {
             ImGui::Checkbox("paint rims (off = raw OEM texture)", (bool *)&g_dbg.rim_paint);
             ImGui::ColorEdit3("rim colour", g_dbg.rim_color);
             if (ImGui::Button("Chrome/Silver")) {
@@ -93,6 +168,50 @@ extern "C" void dbgui_frame(void) {
                 g_dbg.rim_paint=1; g_dbg.rim_color[0]=0.30f; g_dbg.rim_color[1]=0.32f; g_dbg.rim_color[2]=0.36f;
             }
         }
+            ImGui::TextWrapped("Not yet supported: vinyl layers, decals, individual part paint, metallic and pearlescent finishes. Matte is a planned OpenUG2 option.");
+            ImGui::EndTabItem();
+        }
+        if (shop_tab("Performance", ImVec4(0.4f, 0.65f, 1, 1))) {
+            ImGui::TextUnformatted("Blue / Performance Shop");
+            ImGui::TextWrapped("Packages not yet implemented: engine, ECU, transmission, turbo, nitrous, suspension, brakes, tyres, weight reduction.");
+            ImGui::TextWrapped("Handling test controls are in Vehicle Diagnostics. They do not install performance packages.");
+            ImGui::EndTabItem();
+        }
+        if (shop_tab("Safe House", ImVec4(0.8f, 0.55f, 1, 1))) {
+            ImGui::TextUnformatted("Purple / Safe House");
+            ImGui::TextWrapped("Owned inventory and saving are not implemented yet. This will be the place to swap, remove and refit purchased compatible parts without buying them again.");
+            ImGui::TextDisabled("Installed parts (read-only preview)");
+            for (int p=0; g_dbg.mod_parts && p<N2_PART_COUNT; p++) {
+                const N2PartMenu *menu=g_dbg.mod_parts+p;
+                const char *label="Stock / none";
+                for(int i=0;i<menu->count;i++)
+                    if(menu->options[i].value==g_dbg.mod_current.parts[p])label=menu->options[i].label;
+                ImGui::Text("%s: %s",n2_part_labels[p],label);
+            }
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+        }
+        if(g_dbg.body_kit_status[0])ImGui::TextWrapped("%s",g_dbg.body_kit_status);
+        ImGui::EndTabItem();
+    }
+
+    if (ImGui::BeginTabItem("Vehicle Diagnostics")) {
+        if (ImGui::CollapsingHeader("Wheel Stance (per-car, metres)", ImGuiTreeNodeFlags_DefaultOpen)) {
+            /* Absolute stance for the active car -- edits apply next frame, since
+               the wheel transforms are rebuilt from g_dbg.wheel every frame. */
+            ImGui::SliderFloat("front axle Z", &g_dbg.wheel.front_axle,  0.0f, 2.5f, "%.3f m");
+            ImGui::SliderFloat("rear axle Z",  &g_dbg.wheel.rear_axle,  -2.5f, 0.0f, "%.3f m");
+            ImGui::SliderFloat("front track",  &g_dbg.wheel.front_track, 0.8f, 2.2f, "%.3f m");
+            ImGui::SliderFloat("rear track",   &g_dbg.wheel.rear_track,  0.8f, 2.2f, "%.3f m");
+            ImGui::SliderFloat("wheel hub height",&g_dbg.wheel.ride_y,  -0.5f, 0.5f, "%.3f m");
+            ImGui::SliderFloat("body lowering", &g_dbg.body_drop, 0.0f, 0.12f, "%.3f m");
+            ImGui::TextDisabled("Body lowering is limited by ground clearance; wheel contact stays fixed.");
+            ImGui::Text("wheelbase %.3f m", g_dbg.wheel.front_axle - g_dbg.wheel.rear_axle);
+            ImGui::SliderFloat("radius/scale", &g_dbg.wheel_scale, 0.3f, 2.0f);
+            ImGui::Text("radius %.3f m   %.0f RPM   steer %+.1f deg",
+                        g_dbg.wheel_radius, g_dbg.wheel_rpm, g_dbg.steer_deg);
+        }
         if (ImGui::CollapsingHeader("Vehicle Handling", ImGuiTreeNodeFlags_DefaultOpen)) {
             ImGui::Text("live @ %.0f km/h", g_dbg.kmh);
             ImGui::SliderFloat("acceleration", &g_dbg.tune_accel, 0.2f, 3.0f, "%.2fx");
@@ -103,6 +222,10 @@ extern "C" void dbgui_frame(void) {
                 g_dbg.tune_accel=g_dbg.tune_brake=g_dbg.tune_turn=1.0f; g_dbg.tune_top=220.0f;
             }
         }
+        if (ImGui::CollapsingHeader("Engine cover mesh")) {
+            ImGui::TextWrapped("Visual mesh preview only; this does not install an engine upgrade.");
+            part_selector(N2_PART_ENGINE);
+        }
         if (ImGui::CollapsingHeader("Car parts")) {
             ImGui::Checkbox("body",   (bool *)&g_dbg.show_body);   ImGui::SameLine();
             ImGui::Checkbox("glass",  (bool *)&g_dbg.show_glass);  ImGui::SameLine();
@@ -110,7 +233,7 @@ extern "C" void dbgui_frame(void) {
             ImGui::Checkbox("tires",  (bool *)&g_dbg.show_tires);  ImGui::SameLine();
             ImGui::Checkbox("misc",   (bool *)&g_dbg.show_misc);   ImGui::SameLine();
             ImGui::Checkbox("track",  (bool *)&g_dbg.show_track);
-            ImGui::TextDisabled("body paint moved to Vehicle Controls");
+            ImGui::TextDisabled("Paint controls: Modification > Graphics");
         }
         if (ImGui::CollapsingHeader("Mesh Inspector")) {
             static const char *catn[] = {"ROAD","TERRAIN","OTHER","SKY","GLOW","?","?","?","?","?",
@@ -169,15 +292,8 @@ extern "C" void dbgui_frame(void) {
         if (ImGui::CollapsingHeader("Lighting / Fog", ImGuiTreeNodeFlags_DefaultOpen)) {
             ImGui::SliderFloat("ambient",   &g_dbg.ambient,   0.0f, 1.0f);
             ImGui::SliderFloat("diffuse",   &g_dbg.diffuse,   0.0f, 1.5f);
-            ImGui::SliderFloat("body spec", &g_dbg.body_spec, 0.0f, 1.0f);
-            ImGui::SliderFloat("body reflection", &g_dbg.body_env, 0.0f, 2.0f, "%.2fx");
             ImGui::SliderFloat("fog density", &g_dbg.fog_density, 0.0f, 0.01f, "%.4f");
             ImGui::ColorEdit3("fog / sky colour", &g_dbg.fog_r);
-        }
-        if (ImGui::CollapsingHeader("Neon Underglow", ImGuiTreeNodeFlags_DefaultOpen)) {
-            ImGui::Checkbox("neon on", (bool *)&g_dbg.neon_on);
-            ImGui::ColorEdit3("neon colour", g_dbg.neon_col);
-            ImGui::SliderFloat("intensity", &g_dbg.neon_str, 0.0f, 1.5f);
         }
         ImGui::EndTabItem();
     }
@@ -190,12 +306,7 @@ extern "C" void dbgui_frame(void) {
         if (g_dbg.race_cars > 0)
             ImGui::Text("race: P%d/%d   lap %d/%d", g_dbg.race_pos, g_dbg.race_cars,
                         g_dbg.race_lap, g_dbg.race_laps);
-        if (g_dbg.car_list && g_dbg.n_cars > 0) {
-            static const char *items[64]; int n = g_dbg.n_cars < 64 ? g_dbg.n_cars : 64;
-            for (int i = 0; i < n; i++) items[i] = g_dbg.car_list[i];
-            int cur = g_dbg.sel_car;
-            if (ImGui::Combo("car", &cur, items, n) && cur != g_dbg.sel_car) g_dbg.want_car = cur;
-        } else ImGui::Text("car: %s (%d/%d)", g_dbg.car_name, g_dbg.sel_car+1, g_dbg.n_cars);
+        ImGui::Text("car: %s (change in Modification)", g_dbg.car_name);
         if (g_dbg.track_list && g_dbg.n_tracks > 0) {
             static const char *items[64]; int n = g_dbg.n_tracks < 64 ? g_dbg.n_tracks : 64;
             for (int i = 0; i < n; i++) items[i] = g_dbg.track_list[i];

@@ -26,6 +26,7 @@
 #include <SDL.h>
 
 #include "nfsu2.h"
+#include "car_mod.h"
 #include "render.h"
 #include "physics.h"
 #include "ai.h"
@@ -46,6 +47,7 @@
 /* debug tunables — defaults match the previously hard-coded constants, so a
  * normal build behaves exactly as before; `make debug` adds an ImGui panel. */
 DbgState g_dbg = {
+    .body_kit_request = -1, .mod_request_slot = -1,
     .freecam = 0, .speed = 0.6f,
     .chase_distance = 10.0f, .chase_height = 4.5f, .chase_stiffness = 0.22f,
     .race_maxlaps_want = 2,
@@ -53,7 +55,7 @@ DbgState g_dbg = {
        -- an explicit table entry or a body-box fallback -- so no default here. */
     .wheel_scale = 1.0f,
     .insp_sel = -1,
-    .car_cull = 1, .body_clearcoat = 0.55f,
+    .car_cull = 1, .body_clearcoat = 0.70f, .body_drop = 0.060f,
     /* underglow is an OWNED customization, not a stock fitting: off until the
        player buys/enables it. The colour/strength tunables stay live. */
     .neon_on = 0, .neon_col = { 0.15f, 0.45f, 1.0f }, .neon_str = 0.85f,
@@ -124,12 +126,13 @@ static VehicleWheelConfig wheel_config_for(const char *name, const N2CarProfile 
     return c;
 }
 
-/* Stock body-to-wheel suspension trim. The model and wheel data share a hub
- * origin, but NFSU2 also has per-car stance/suspension tuning outside the mesh.
- * That table is not decoded yet; keep the known tune explicit and local rather
- * than moving the tyre off the road or corrupting the asset coordinates. */
-static float stock_body_drop(const char *name) {
-    return name && !strcmp(name, "MIATA") ? 0.040f : 0.0f;
+/* Shared by body rendering/collision and candidate-part clearance checks.
+ * ponytail: conservative AABB clearance, not decoded retail suspension tuning.
+ * Keep at least 4 cm under the body where the original model permits it. */
+static float body_ride_height(float wheel_ride, float body_bottom, float drop) {
+    float base=fmaxf(0.05f,wheel_ride);
+    float available=fmaxf(0.0f,base+body_bottom-0.04f);
+    return fmaxf(0.05f,base-fminf(fmaxf(drop,0.0f),available));
 }
 
 /* Read-only contact audit for the four wheels exactly where the renderer puts
@@ -175,25 +178,24 @@ static void wheel_contact_residuals(const N2Scene *scene, const float pos[3],
  * reload path could easily do quietly. */
 /* Load one aftermarket rim style out of a wheel-brand archive and upload it.
  * The archive holds several size/width variants; use all slices of the first
- * complete tier. Frees any previously uploaded rim. Returns 1 on success. */
+ * complete tier. Replaces the active rim only after a complete load succeeds. */
 static int load_rim_style(const unsigned char *wldata, long wllen,
                           const uint32_t *wkeys, int nwkeys, int style,
-                          N2Scene *lib, GpuMesh **gm, int *ngm,
+                          N2Scene *active, GpuMesh **active_gm, int *ngm,
                           const unsigned char *wtdata, long wtlen,
-                          GLuint *rimtex, int *rimmode, float fitR) {
-    if (!wldata) { (void)wllen; return 0; }
-    for (int i = 0; i < *ngm; i++) {
-        glDeleteBuffers(1, &(*gm)[i].vbo);
-        glDeleteBuffers(1, &(*gm)[i].nbo);
-        glDeleteBuffers(1, &(*gm)[i].ibo);
-    }
-    free(*gm); *gm = NULL; *ngm = 0;
-    n2_free_scene(lib);
-    N2CarConfig wcfg = { 0, style, 0, style };   /* STYLEnn selects the rim */
+                          GLuint *active_tex, int *active_mode, float fitR) {
+    if (!wldata || wllen <= 0 || !isfinite(fitR)) return 0;
+    N2Scene candidate = {0}, *lib = &candidate;
+    GpuMesh *gm = NULL;
+    GLuint rimtex = 0;
+    int rimmode = N2_DRAW_OPAQUE;
+    N2Tex rt = {0};
+    N2CarConfig wcfg = {.hood_style=style,.wheel_style_id=style};   /* STYLEnn selects the rim */
     int n = n2_load_car(wldata, wllen, lib, wkeys, nwkeys, &wcfg);
-    if (n <= 0) return 0;
+    if (n <= 0) goto failed;
     n = n2_rim_select_tier(lib);
-    if (n <= 0) return 0;
+    if (n <= 0) goto failed;
+    if (lib->meshes[0].vkind != 2 || lib->meshes[0].vnum != style) goto failed;
     for (int i=0;i<n;i++) n2_prepare_wheel_mesh(&lib->meshes[i]);
     int triangles=0;
     for (int i=0;i<n;i++) triangles+=lib->meshes[i].nidx/3;
@@ -207,30 +209,32 @@ static int load_rim_style(const unsigned char *wldata, long wllen,
     if (fitR > 0.0f && lib->count) {
         float bb[6]; n2_mesh_bbox(&lib->meshes[0], bb);
         float rimR = 0.25f * ((bb[1]-bb[0]) + (bb[5]-bb[4]));   /* mean X-Z radius */
-        if (rimR > 1e-4f) {
-            float sc = fitR / rimR;
-            for (int mi = 0; mi < lib->count; mi++) {
-                N2Mesh *mm = &lib->meshes[mi];
-                for (int v = 0; v < mm->nverts; v++)
-                    for (int a = 0; a < 3; a++) mm->verts[v*5+a] *= sc;
-            }
-            printf("  rim fit: rimR %.3f -> car wheel %.3f (x%.2f)\n", rimR, fitR, sc);
+        if (!isfinite(rimR) || rimR <= 1e-4f) goto failed;
+        float sc = fitR / rimR;
+        for (int mi = 0; mi < lib->count; mi++) {
+            N2Mesh *mm = &lib->meshes[mi];
+            for (int v = 0; v < mm->nverts; v++)
+                for (int a = 0; a < 3; a++) mm->verts[v*5+a] *= sc;
         }
+        printf("  rim fit: rimR %.3f -> car wheel %.3f (x%.2f)\n", rimR, fitR, sc);
     }
-    *gm = upload_scene(lib); *ngm = n;
-
     /* Bind the rim's own diffuse out of WHEELS/TEXTURES.BIN. Every submesh of
        a given style carries the SAME key (measured across BBS/ENKEI/VOLK/OZ/
        LEXANI/WORK/ADVAN), so one texture covers the whole rim -- hence a
        single GLuint rather than a per-mesh map like the car body uses. */
-    if (*rimtex) { glDeleteTextures(1, rimtex); *rimtex = 0; }
-    *rimmode=N2_DRAW_OPAQUE;
     uint32_t tk = lib->count ? lib->meshes[0].texkey : 0;
-    N2Tex rt; memset(&rt, 0, sizeof rt);
     long ar=0, ag=0, ab=0, bmn=255, bmx=0;
-    if (tk && wtdata && n2_load_car_tex_by_key(wtdata, wtlen, tk, &rt)) {
-        *rimtex = upload_tpk_texture_to_gpu(&rt);
-        *rimmode=n2_tex_mode(&rt);
+    if (!tk || !wtdata || !n2_load_car_tex_by_key(wtdata, wtlen, tk, &rt) ||
+        !rt.rgb || rt.w <= 0 || rt.h <= 0) goto failed;
+    /* Do not commit resources after a failed GPU upload (or a pending GL error). */
+    if (glGetError() != GL_NO_ERROR) goto failed;
+    gm = upload_scene(lib);
+    if (!gm || glGetError() != GL_NO_ERROR) goto failed;
+    for (int i = 0; i < n; i++)
+        if (!gm[i].vbo || !gm[i].nbo || !gm[i].ibo) goto failed;
+    {
+        rimtex = upload_tpk_texture_to_gpu(&rt);
+        rimmode=n2_tex_mode(&rt);
         /* rim sheets are atlases with UVs in [0,1]: clamp so REPEAT wrap +
            mip filtering cannot bleed the opposite border in (same reason as
            the car body atlases above). */
@@ -241,15 +245,137 @@ static int load_rim_style(const unsigned char *wldata, long wllen,
             ar += rt.rgb[p*3]; ag += rt.rgb[p*3+1]; ab += b;
             if (b < bmn) bmn = b; if (b > bmx) bmx = b; }
         if (np) { ar/=np; ag/=np; ab/=np; }
-        free(rt.rgb); free(rt.alpha); free(rt.dxt);
     }
+    if (!rimtex || glGetError() != GL_NO_ERROR) goto failed;
+    free(rt.rgb); free(rt.alpha); free(rt.dxt);
+    free_scene_gpu(*active_gm, *ngm);
+    n2_free_scene(active);
+    if (*active_tex) glDeleteTextures(1, active_tex);
+    *active = candidate; *active_gm = gm; *ngm = n;
+    *active_tex = rimtex; *active_mode = rimmode;
     /* channel telemetry: B min/max spanning 0..255 confirms the decode is NOT
        truncating blue -- the low average is an authentic gold/bronze rim. */
     printf("  rim diffuse: texkey %08x -> %s (%dx%d) avg RGB %ld,%ld,%ld  B[min %ld..max %ld]\n",
-           tk, *rimtex ? "bound" : "UNRESOLVED, untextured geometry",
-           *rimtex ? rt.w : 0, *rimtex ? rt.h : 0, ar, ag, ab, bmn, bmx);
-    printf("  rim material: draw mode %d\n",*rimmode);
+           tk, "bound", rt.w, rt.h, ar, ag, ab, bmn, bmx);
+    printf("  rim material: draw mode %d\n",rimmode);
     return 1;
+failed:
+    free(rt.rgb); free(rt.alpha); free(rt.dxt);
+    free_scene_gpu(gm, candidate.count);
+    if (rimtex) glDeleteTextures(1, &rimtex);
+    n2_free_scene(&candidate);
+    fprintf(stderr, "Wheel style %d could not be loaded; keeping current wheels.\n", style);
+    return 0;
+}
+
+/* A kit candidate owns only its replacement meshes and newly needed textures.
+ * Existing paint/vinyl textures stay cached for this car across kit changes. */
+typedef struct {
+    N2Scene scene;
+    GpuMesh *gpu;
+    int stock_wheel, ntextures;
+    float bb[6], bloom[4][4];
+    uint32_t keys[128];
+    GLuint textures[128];
+    char alpha[128], mode[128];
+} BodyKitCandidate;
+
+static void body_kit_release(BodyKitCandidate *kit) {
+    free_scene_gpu(kit->gpu, kit->scene.count);
+    n2_free_scene(&kit->scene);
+    for (int i=0;i<kit->ntextures;i++) glDeleteTextures(1,&kit->textures[i]);
+    memset(kit,0,sizeof *kit);
+}
+
+static int car_body_metrics(const N2Scene *car, float bb[6], float bloom[4][4]) {
+    for(int a=0;a<3;a++){bb[a]=1e30f;bb[a+3]=-1e30f;}
+    double light[4][3]={{0}};int count[4]={0};
+    memset(bloom,0,16*sizeof(float));
+    for(int i=0;i<car->count;i++) {
+        const N2Mesh*m=&car->meshes[i];
+        if(!m->verts || !m->idx || m->nverts<=0 || m->nidx<=0 || m->nidx%3)return 0;
+        for(int j=0;j<m->nidx;j++)if(m->idx[j]>=m->nverts)return 0;
+        for(int v=0;v<m->nverts;v++) {
+            const float*p=m->verts+v*5;
+            for(int a=0;a<5;a++)if(!isfinite(p[a]))return 0;
+            if(m->cat!=N2_CAR_TIRE)for(int a=0;a<3;a++) {
+                bb[a]=fminf(bb[a],p[a]);bb[a+3]=fmaxf(bb[a+3],p[a]);
+            }
+            if(m->cat==N2_CAR_LIGHT || m->cat==N2_CAR_BRAKELIGHT) {
+                int b=(p[0]<0?2:0)+(p[1]<0?1:0);
+                for(int a=0;a<3;a++)light[b][a]+=p[a];count[b]++;
+            }
+        }
+    }
+    for(int a=0;a<3;a++)if(bb[a+3]-bb[a]<0.01f)return 0;
+    for(int b=0;b<4;b++)if(count[b]>40) {
+        for(int a=0;a<3;a++)bloom[b][a]=(float)(light[b][a]/count[b]);
+        bloom[b][3]=1;
+    }
+    return 1;
+}
+
+static int prepare_body_kit(BodyKitCandidate *kit,
+        const unsigned char *data,long len,const uint32_t *keys,int nkeys,
+        const N2CarConfig *config,const unsigned char *texdata,long texlen,
+        const N2Scene *active,const uint32_t *cached,int ncached,const char *dataroot) {
+    memset(kit,0,sizeof *kit);kit->stock_wheel=-1;
+    if(!data || len<=0 || ncached<0 || ncached>128)return 0;
+    if(n2_load_car(data,len,&kit->scene,keys,nkeys,config)<=0)goto failed;
+    if(!n2_mod_assemble(dataroot,data,len,config,&kit->scene))goto failed;
+    int selected=config->body_kit==0;
+    for(int p=0;p<N2_PART_COUNT;p++)if(config->parts[p])selected=1;
+    for(int i=0;i<kit->scene.count;i++) {
+        const N2Mesh*m=&kit->scene.meshes[i];
+        if(m->vkind==1 && m->vnum==config->body_kit)selected=1;
+    }
+    if(!selected || !car_body_metrics(&kit->scene,kit->bb,kit->bloom))goto failed;
+    /* A kit replaces families; it must not drop unchanged stock attachments. */
+    for(int i=0;i<active->count;i++) {
+        const N2Mesh*m=&active->meshes[i];
+        if(!m->famkey || ((m->vkind==1 || m->vkind==2) && m->vnum!=0))continue;
+        int found=0;
+        for(int j=0;j<kit->scene.count;j++) {
+            const N2Mesh *candidate=kit->scene.meshes+j;
+            if(candidate->famkey==m->famkey || (m->car_part &&
+               config->parts[m->car_part-1] && candidate->car_part==m->car_part))found=1;
+        }
+        if(!found)goto failed;
+    }
+    kit->stock_wheel=n2_car_prepare_wheels(&kit->scene);
+    if(glGetError()!=GL_NO_ERROR)goto failed;
+    kit->gpu=upload_scene(&kit->scene);
+    if(!kit->gpu || glGetError()!=GL_NO_ERROR)goto failed;
+    for(int i=0;i<kit->scene.count;i++) {
+        if(!kit->gpu[i].vbo || !kit->gpu[i].nbo || !kit->gpu[i].ibo)goto failed;
+        uint32_t tk=kit->scene.meshes[i].texkey;int seen=!tk;
+        for(int j=0;j<ncached;j++)if(cached[j]==tk)seen=1;
+        for(int j=0;j<kit->ntextures;j++)if(kit->keys[j]==tk)seen=1;
+        if(seen)continue;
+        N2Tex t={0};int loaded=texdata && n2_load_car_tex_by_key(texdata,texlen,tk,&t);
+        if(!loaded) {
+            free(t.rgb);free(t.alpha);free(t.dxt);
+            /* Keep existing untextured stock parts' established fallback. */
+            for(int j=0;j<active->count;j++)if(active->meshes[j].texkey==tk)seen=1;
+            if(seen)continue;
+            goto failed;
+        }
+        if(!t.rgb || t.w<=0 || t.h<=0 || ncached+kit->ntextures>=128) {
+            free(t.rgb);free(t.alpha);free(t.dxt);goto failed;
+        }
+        int j=kit->ntextures++;
+        kit->keys[j]=tk;kit->textures[j]=upload_tpk_texture_to_gpu(&t);
+        kit->alpha[j]=t.alpha!=NULL && t.dxtfmt!=1;
+        kit->mode[j]=(char)n2_tex_mode(&t);
+        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE);
+        free(t.rgb);free(t.alpha);free(t.dxt);
+        if(!kit->textures[j] || glGetError()!=GL_NO_ERROR)goto failed;
+    }
+    return 1;
+failed:
+    body_kit_release(kit);
+    return 0;
 }
 
 static void relaunch(const char *selfexe, const char *dataroot,
@@ -376,7 +502,7 @@ static int dump_car_info(const char *dataroot, const char *car) {
     {   uint32_t loadkeys[512]; int nloadkeys = 0;
         long tn0 = 0; unsigned char *td0 = n2_read_file(tp, &tn0);
         if (td0) nloadkeys = n2_car_tex_keys(td0, tn0, loadkeys, 512);
-        N2Scene loaded; N2CarConfig stock = {0,0,0,0};
+        N2Scene loaded; N2CarConfig stock = {0};
         int nloaded = n2_load_car(g, gn, &loaded, loadkeys, nloadkeys, &stock);
         long loaded_cat[24] = {0};
         for (int i = 0; i < nloaded; i++) if (loaded.meshes[i].cat >= 0 && loaded.meshes[i].cat < 24)
@@ -1795,7 +1921,7 @@ int main(int argc, char **argv) {
             long gl2 = 0; unsigned char *gd2 = n2_read_file(gp2, &gl2);
             pv[c] = phys_vehicle_from_geometry(0,0,0,0,0,0);
             if (!gd2) { printf("  %s: cannot read %s\n", nmv[c], gp2); continue; }
-            N2Scene cs = {0}; N2CarConfig cc0 = {0,0,0,0}; uint32_t nk2[1]; int dmy = 0;
+            N2Scene cs = {0}; N2CarConfig cc0 = {0}; uint32_t nk2[1]; int dmy = 0;
             if (n2_load_car(gd2, gl2, &cs, nk2, 0, &cc0) > 0) {
                 N2CarProfile cp; memset(&cp, 0, sizeof cp);
                 n2_car_profile(&cs, nmv[c], WHEEL_SEED_FRONTF, WHEEL_SEED_REARF,
@@ -1856,7 +1982,7 @@ int main(int argc, char **argv) {
             char gp2[1024]; snprintf(gp2, sizeof gp2, "%s/CARS/%s/GEOMETRY.BIN", dataroot, cl[i]);
             long gl2 = 0; unsigned char *gd2 = n2_read_file(gp2, &gl2);
             if (!gd2) continue;
-            N2Scene cs = {0}; N2CarConfig cc0 = { 0, 0, 0, 0 };
+            N2Scene cs = {0}; N2CarConfig cc0 = {0};
             uint32_t nk2[1];
             int nmc = n2_load_car(gd2, gl2, &cs, nk2, 0, &cc0);
             if (nmc > 0) {
@@ -3472,7 +3598,7 @@ int main(int argc, char **argv) {
        by a mesh into its own GL texture (body, wheel, brake, ... bound by UVs). */
     uint32_t ckeys[512]; int nck = ctdata ? n2_car_tex_keys(ctdata, ctlen, ckeys, 512) : 0;
     uint32_t mapkey[128]; GLuint maptex[128]; char mapalpha[128], mapmode[128]; int nmap = 0;
-    N2Scene car; int ncar = 0; GpuMesh *cgm = NULL;
+    N2Scene car={0}; int ncar = 0; GpuMesh *cgm = NULL;
     int stock_wheel = -1;   /* representative of the complete stock wheel tier */
     float wheelT[4][16];                         /* 4 wheel placements (car-local) */
     float wheelTAI[4][16];                       /* same, minus the player's steer (AI cars) */
@@ -3484,8 +3610,8 @@ int main(int argc, char **argv) {
                                                     flag: 0 front-L, 1 front-R, 2 rear-L, 3 rear-R */
     float carWheelR = 0.0f;                       /* car's stock wheel radius (rim fit) */
     N2CarProfile carprof; memset(&carprof, 0, sizeof carprof);   /* per-car dimensions */
-    N2CarConfig carcfg = { 0, 0, 0, 0 };         /* active customization profile */
-    int kit_ids[32], nkit_ids = 0, kit_cursor = 0;
+    N2CarConfig carcfg = {0};         /* active customization profile */
+    int kit_ids[100], nkit_ids = 0, kit_cursor = 0;
     float spawn[3] = {
         world2 ? world2_spawn_xy[0] : cx,
         world2 ? world2_spawn_xy[1] : cy,
@@ -3512,32 +3638,22 @@ int main(int argc, char **argv) {
            buried in the body. Place it at 4 arch positions derived from the body
            AABB. ponytail: fractions, since no explicit wheel data exists in
            GEOMETRY.BIN / PARTS_ANIMATIONS.bin — tune here if a car sits wrong. */
-        float bb0[3]={1e30f,1e30f,1e30f}, bb1[3]={-1e30f,-1e30f,-1e30f};
         float tb0[3]={1e30f,1e30f,1e30f}, tb1[3]={-1e30f,-1e30f,-1e30f}; int ntv=0;
         for (int i=0;i<ncar;i++) {
             int tire = car.meshes[i].cat==N2_CAR_TIRE;
             for (int v=0; v<car.meshes[i].nverts; v++) {
                 float *p=car.meshes[i].verts+v*5;
                 if (tire) { ntv++; for(int a=0;a<3;a++){ if(p[a]<tb0[a])tb0[a]=p[a]; if(p[a]>tb1[a])tb1[a]=p[a]; } }
-                else for (int a=0;a<3;a++){ if(p[a]<bb0[a])bb0[a]=p[a]; if(p[a]>bb1[a])bb1[a]=p[a]; }
             }
         }
-        carbb[0]=bb0[0];carbb[1]=bb0[1];carbb[2]=bb0[2];
-        carbb[3]=bb1[0];carbb[4]=bb1[1];carbb[5]=bb1[2];  /* wheelT built per-frame from g_dbg */
+        if(!car_body_metrics(&car,carbb,bloomc)) {
+            fprintf(stderr,"invalid car geometry\n");return 1;
+        }
         stock_wheel = n2_car_prepare_wheels(&car);
         /* Light-bloom clusters: average the lens vertices in each of the 4
            quadrants (front/rear x sign, left/right y sign) to get a halo anchor
            per headlight/taillight group. A vertex threshold keeps a stray single
            lamp from spawning a halo. */
-        { double a[4][3]={{0}}; long ln[4]={0,0,0,0};
-          for (int i=0;i<ncar;i++){ int c=car.meshes[i].cat;
-              if (c!=N2_CAR_LIGHT && c!=N2_CAR_BRAKELIGHT) continue;
-              for (int v=0;v<car.meshes[i].nverts;v++){ float *p=car.meshes[i].verts+v*5;
-                  int b=(p[0]<0?2:0)+(p[1]<0?1:0);
-                  a[b][0]+=p[0]; a[b][1]+=p[1]; a[b][2]+=p[2]; ln[b]++; } }
-          for (int b=0;b<4;b++) if (ln[b]>40) {
-              bloomc[b][0]=(float)(a[b][0]/ln[b]); bloomc[b][1]=(float)(a[b][1]/ln[b]);
-              bloomc[b][2]=(float)(a[b][2]/ln[b]); bloomc[b][3]=1.0f; } }
         cgm = upload_scene(&car);
         /* size the procedural tyre from the car's own wheel mesh (radius in X-Z,
            width in Y) so a Hummer gets big tyres and a compact gets small ones. */
@@ -3731,6 +3847,15 @@ int main(int argc, char **argv) {
         printf("car: %d meshes, spawn (%.1f,%.1f) heading %.2f\n",
                ncar, spawn[0], spawn[1], heading0);
     }
+
+    /* Opponents retain the initial car geometry when the player changes kits. */
+    N2Scene opponent_car=car;
+    GpuMesh *opponent_cgm=cgm;
+    const int opponent_ncar=ncar;
+    g_dbg.body_kit_ids=kit_ids;g_dbg.body_kit_count=nkit_ids;
+    static N2PartMenu modification[N2_PART_COUNT];
+    if(cdata)n2_mod_catalog(dataroot,cdata,clen,&car,modification);
+    g_dbg.mod_parts=modification;g_dbg.mod_current=carcfg;
 
     /* Static-capture spawn (Milestone 80). Everything above is the shipped
        interactive/menu/race spawn and stays exactly as it was; this only runs
@@ -4945,10 +5070,8 @@ int main(int argc, char **argv) {
         cam[1] = carpos[1] - sinf(heading0)*g_dbg.chase_distance;
         cam[2] = carpos[2] + g_dbg.chase_height;
     }
-    const float car_body_drop = stock_body_drop(carname);
-    if (car_body_drop > 0.0f)
-        printf("stock suspension %-12s body drop %.3f m (wheels remain on contact)\n",
-               carname, car_body_drop);
+    printf("stance %-12s requested body drop %.3f m (clearance limited; wheels remain on contact)\n",
+           carname, g_dbg.body_drop);
     float fc[3] = { spawn[0]-6, spawn[1], spawn[2]+3 };   /* freecam eye */
     float fyaw = 0.0f, fpitch = -0.25f;                   /* freecam look angles */
     int   mlook = 0;                                      /* right-drag mouse look active */
@@ -5192,34 +5315,27 @@ int main(int argc, char **argv) {
                     }
                 }
                 else if (k == SDLK_F6 && !e.key.repeat && wldata) {
-                    wheel_style = wheel_style % 8 + 1;   /* 1..8 */
-                    g_dbg.wheel_style = wheel_style;
-                    if (load_rim_style(wldata, wllen, wkeys, nwkeys, wheel_style,
+                    int styles[100], ns = n2_car_variant_numbers(wldata, wllen, 2, styles, 100);
+                    int next = 0;
+                    while (next < ns && styles[next] <= wheel_style) next++;
+                    if (next == ns) next = 0;
+                    g_dbg.wheel_load_failed = 1;
+                    /* Skip broken styles without stranding F6 on one. */
+                    for (int attempt = 0; attempt < ns; attempt++) {
+                        int requested = styles[(next + attempt) % ns];
+                        if (!load_rim_style(wldata, wllen, wkeys, nwkeys, requested,
                                        &wheellib, &wheelgm, &nwheelgm,
-                                       wtdata, wtlen, &rimtex, &rimmode, carWheelR))
+                                       wtdata, wtlen, &rimtex, &rimmode, carWheelR)) continue;
+                        wheel_style = requested;
+                        g_dbg.wheel_style = wheel_style;
+                        g_dbg.wheel_load_failed = 0;
                         printf("rims -> %s style %d (%d mesh(es))\n",
                                wheel_brands[wheel_brand], wheel_style, nwheelgm);
-                }
-                else if (k == SDLK_k && cdata) {
-                    /* Cycle the variants that actually exist in this archive,
-                       not a guessed KIT00/01/02 subset. Re-streaming only the
-                       car buffers is cheap and leaves the world/physics state
-                       untouched. */
-                    if (nkit_ids > 1) {
-                        kit_cursor = (kit_cursor + 1) % nkit_ids;
-                        carcfg.body_kit = kit_ids[kit_cursor];
-                    } else carcfg.body_kit = 0;
-                    for (int i = 0; i < ncar; i++) {
-                        glDeleteBuffers(1, &cgm[i].vbo);
-                        glDeleteBuffers(1, &cgm[i].nbo);
-                        glDeleteBuffers(1, &cgm[i].ibo);
+                        break;
                     }
-                    free(cgm); cgm = NULL;
-                    n2_free_scene(&car);
-                    ncar = n2_load_car(cdata, clen, &car, ckeys, nck, &carcfg);
-                    stock_wheel = n2_car_prepare_wheels(&car);
-                    cgm = upload_scene(&car);
-                    printf("body kit -> KIT%02d (%d meshes)\n", carcfg.body_kit, ncar);
+                }
+                else if (k == SDLK_k && !e.key.repeat && nkit_ids>0) {
+                    g_dbg.body_kit_request=kit_ids[(kit_cursor+1)%nkit_ids];
                 }
                 else if (race_state == 3) {   /* pre-race menu navigation */
                     /* car and track each mean a whole new load, so they re-launch
@@ -5336,6 +5452,66 @@ int main(int argc, char **argv) {
             }
         }
 #endif
+
+        /* Both K and the panel use one stopped-car transaction, before drawing. */
+        if(g_dbg.body_kit_request>=0 || g_dbg.mod_request_slot>=0) {
+            int requested=g_dbg.body_kit_request, cursor=kit_cursor;
+            int part=g_dbg.mod_request_slot,value=g_dbg.mod_request_value;
+            g_dbg.body_kit_request=-1;g_dbg.mod_request_slot=-1;
+            const char *error=NULL;
+            BodyKitCandidate kit={0};N2CarConfig next=carcfg;
+            if(part>=0) {
+                int found=0;
+                if(part<N2_PART_COUNT)for(int i=0;i<modification[part].count;i++)
+                    if(modification[part].options[i].value==value)found=1;
+                if(!found)error="That part is not available for this car.";
+                else next.parts[part]=value;
+            } else {
+                cursor=-1;
+                for(int i=0;i<nkit_ids;i++)if(kit_ids[i]==requested)cursor=i;
+                if(cursor<0)error="That kit is not available for this car.";
+                next.body_kit=requested;
+                for(int p=0;p<N2_PART_SPOILER;p++)
+                    if(p!=N2_PART_AUDIO && p!=N2_PART_ENGINE)next.parts[p]=0;
+            }
+            if(fabsf(PHYS_KMH(speed))>1.0f)error="Stop the car before changing parts.";
+            if(!error && memcmp(&next,&carcfg,sizeof next)) {
+                if(!prepare_body_kit(&kit,cdata,clen,ckeys,nck,&next,ctdata,ctlen,
+                                     &car,mapkey,nmap,dataroot))error="Part could not be loaded or attached. Current parts kept.";
+                else {
+                    float pos[3]={carpos[0],carpos[1],carpos[2]}, v[2]={0,0};
+                    float scale=g_dbg.wheel_scale>0.05f?g_dbg.wheel_scale:1.0f;
+                    float ride=body_ride_height(carprof.ride*scale,kit.bb[2],g_dbg.body_drop);
+                    float z0=pos[2]+ride+kit.bb[2], z1=pos[2]+ride+kit.bb[5];
+                    if(collide_body_walls(pos,v,heading,kit.bb,obst,obstz,nobst,z0,z1,
+                                          &scene,obstsrc,NULL,0)>0 ||
+                       world_body_wall_push(&scene,pos,v,heading,kit.bb,z0,z1,NULL) ||
+                       ss_ceiling_above(&scene,(const float (*)[4])world.neighborhood.mbb,
+                                        carpos[0],carpos[1],carpos[2])<z1)
+                        error="Not enough clearance here. Current parts kept.";
+                }
+                if(!error) {
+                    if(cgm!=opponent_cgm){free_scene_gpu(cgm,ncar);n2_free_scene(&car);}
+                    car=kit.scene;cgm=kit.gpu;ncar=car.count;stock_wheel=kit.stock_wheel;
+                    memcpy(carbb,kit.bb,sizeof carbb);memcpy(bloomc,kit.bloom,sizeof bloomc);
+                    for(int a=0;a<3;a++){carprof.body[a*2]=carbb[a];carprof.body[a*2+1]=carbb[a+3];}
+                    carprof.clearance=carprof.ride+carbb[2];
+                    for(int j=0;j<kit.ntextures;j++) {
+                        mapkey[nmap]=kit.keys[j];maptex[nmap]=kit.textures[j];
+                        mapalpha[nmap]=kit.alpha[j];mapmode[nmap++]=kit.mode[j];
+                    }
+                    memset(&kit.scene,0,sizeof kit.scene);kit.gpu=NULL;kit.ntextures=0;
+                    carcfg=next;kit_cursor=cursor;g_dbg.body_kit_current=carcfg.body_kit;
+                    g_dbg.mod_current=carcfg;
+                    g_dbg.insp_sel=-1;
+                }
+            }
+            body_kit_release(&kit);
+            if(error)snprintf(g_dbg.body_kit_status,sizeof g_dbg.body_kit_status,"%s",error);
+            else if(part>=0)snprintf(g_dbg.body_kit_status,sizeof g_dbg.body_kit_status,"%s installed.",n2_part_labels[part]);
+            else snprintf(g_dbg.body_kit_status,sizeof g_dbg.body_kit_status,"KIT%02d preset installed.",carcfg.body_kit);
+            printf("body kit: %s\n",g_dbg.body_kit_status);
+        }
 
         if (resident_route_audit &&
             (resident_route_frame == 2 || resident_route_frame == 6)) {
@@ -5988,8 +6164,8 @@ int main(int argc, char **argv) {
            a per-car body drop never moves the tyre off the road. */
         float car_ride = carprof.ride
                        * (g_dbg.wheel_scale > 0.05f ? g_dbg.wheel_scale : 1.0f);
-        float car_body_ride = car_ride - car_body_drop;
-        if (car_body_ride < 0.05f) car_body_ride = 0.05f;
+        float car_body_ride = body_ride_height(car_ride,carbb[2],g_dbg.body_drop);
+        float car_body_drop = car_ride-car_body_ride;
         float car_z0 = carpos[2] + car_body_ride + carbb[2];
         float car_z1 = carpos[2] + car_body_ride + carbb[5];
         if (car_z1 - car_z0 < 0.5f) car_z1 = car_z0 + 1.5f;   /* no car body loaded */
@@ -7355,15 +7531,15 @@ int main(int argc, char **argv) {
                                      -sh*N2_SUN_X + ch*N2_SUN_Y, N2_SUN_Z);
                   glUniform3f(rp.uCamPos, ch*dx + sh*dy, -sh*dx + ch*dy, dz); }
                 glUniform3f(uColor, ais[k].col[0], ais[k].col[1], ais[k].col[2]);
-                for (int i = 0; i < ncar; i++) {
-                    int mount=car.meshes[i].car_mount;
+                for (int i = 0; i < opponent_ncar; i++) {
+                    int mount=opponent_car.meshes[i].car_mount;
                     if (mount==N2_MOUNT_WHEEL) continue;
                     if (mount==N2_MOUNT_FRONT_BRAKE || mount==N2_MOUNT_REAR_BRAKE) {
                         int first=mount==N2_MOUNT_FRONT_BRAKE?0:2;
                         for(int w=first;w<first+2;w++){float MB[16];mat_mul(AIWheelMVP,brakeTAI[w],MB);
-                            glUniformMatrix4fv(uMVP,1,GL_FALSE,MB);draw_gpumesh(&cgm[i]);g_dbg.drawn++;}
+                            glUniformMatrix4fv(uMVP,1,GL_FALSE,MB);draw_gpumesh(&opponent_cgm[i]);g_dbg.drawn++;}
                         glUniformMatrix4fv(uMVP,1,GL_FALSE,AIMVPc);
-                    } else { draw_gpumesh(&cgm[i]); g_dbg.drawn++; }
+                    } else { draw_gpumesh(&opponent_cgm[i]); g_dbg.drawn++; }
                 }
                 if (have_wheel && g_dbg.show_tires) {     /* procedural tyres */
                     glUniform1f(uUseTex, 1.0f); glBindTexture(GL_TEXTURE_2D, texWheel);
@@ -7986,20 +8162,29 @@ int main(int argc, char **argv) {
         }
         if (g_dbg.wheel_reload) {          /* panel picked a brand/style */
             g_dbg.wheel_reload = 0;
-            if (g_dbg.wheel_brand >= 0 && g_dbg.wheel_brand < n_wheel_brands &&
-                g_dbg.wheel_brand != wheel_brand) {
+            int brand = g_dbg.wheel_brand, style = g_dbg.wheel_style;
+            long candidate_len = wllen;
+            unsigned char *candidate_data = wldata;
+            if (brand < 0 || brand >= n_wheel_brands) candidate_data = NULL;
+            else if (brand != wheel_brand) {
                 char wlp[1024];
                 snprintf(wlp, sizeof wlp, "%s/CARS/WHEELS/GEOMETRY_%s.BIN",
-                         dataroot, wheel_brands[g_dbg.wheel_brand]);
-                unsigned char *nd = n2_read_file(wlp, &wllen);
-                if (nd) { free(wldata); wldata = nd; wheel_brand = g_dbg.wheel_brand; }
+                         dataroot, wheel_brands[brand]);
+                candidate_data = n2_read_file(wlp, &candidate_len);
             }
-            wheel_style = g_dbg.wheel_style < 1 ? 1 : g_dbg.wheel_style;
-            if (load_rim_style(wldata, wllen, wkeys, nwkeys, wheel_style,
+            g_dbg.wheel_load_failed = !load_rim_style(candidate_data, candidate_len,
+                               wkeys, nwkeys, style,
                                &wheellib, &wheelgm, &nwheelgm,
-                               wtdata, wtlen, &rimtex, &rimmode, carWheelR))
+                               wtdata, wtlen, &rimtex, &rimmode, carWheelR);
+            if (!g_dbg.wheel_load_failed) {
+                if (candidate_data != wldata) free(wldata);
+                wldata = candidate_data; wllen = candidate_len;
+                wheel_brand = brand; wheel_style = style;
                 printf("rims -> %s style %d (%d mesh(es))\n",
                        wheel_brands[wheel_brand], wheel_style, nwheelgm);
+            } else if (candidate_data != wldata) free(candidate_data);
+            g_dbg.wheel_brand = wheel_brand;
+            g_dbg.wheel_style = wheel_style;
         }
         if (g_dbg.want_car >= 0 && g_dbg.want_car < ncars)
             relaunch(selfexe, dataroot, carlist[g_dbg.want_car], trackname, render_width, render_height);
@@ -8715,6 +8900,14 @@ int main(int argc, char **argv) {
 #ifdef DEBUG_UI
     dbgui_shutdown();
 #endif
+    free_scene_gpu(wheelgm, nwheelgm);
+    n2_free_scene(&wheellib);
+    if (rimtex) glDeleteTextures(1, &rimtex);
+    free(wldata); free(wtdata);
+    if(cgm!=opponent_cgm){free_scene_gpu(cgm,ncar);n2_free_scene(&car);}
+    free_scene_gpu(opponent_cgm,opponent_ncar);n2_free_scene(&opponent_car);
+    for(int i=0;i<nmap;i++)glDeleteTextures(1,&maptex[i]);
+    free(cdata);free(ctdata);
     world_resident_job_cancel(&resident_job); /* join before active-grid/GL teardown */
     world_resident_free(retired_resident);
     if (world2) {

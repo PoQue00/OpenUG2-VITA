@@ -4,6 +4,7 @@
  * just holds its defaults, so the engine reads it the same either way. */
 #ifndef OPENUG2_DEBUG_H
 #define OPENUG2_DEBUG_H
+#include "car_config.h"
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -151,6 +152,13 @@ typedef struct {
     int  wheel_brand;                /* selected index */
     int  wheel_style;                /* STYLEnn within that brand */
     int  wheel_reload;               /* panel sets 1 => main.c re-streams rims */
+    int  wheel_load_failed;
+    const N2PartMenu *mod_parts;
+    N2CarConfig mod_current;
+    int mod_request_slot, mod_request_value;
+    const int *body_kit_ids;
+    int body_kit_count, body_kit_current, body_kit_request;
+    char body_kit_status[128];
 
     /* --- Mesh Inspector (passive: observes/overlays, never alters assets) --- */
     int  insp_count;        /* how many car meshes are inspectable */
@@ -212,6 +220,7 @@ typedef struct {
 
     int   car_cull;         /* 1 = back-face cull the car shell */
     float body_clearcoat;   /* tight lacquer highlight over the base coat */
+    float body_drop;        /* requested body lowering, metres; tyre contact unchanged */
 
     /* --- neon underglow (a real customization, not a diagnostic) --- */
     int   neon_on;          /* 1 = project the underglow pool */

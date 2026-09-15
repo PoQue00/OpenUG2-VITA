@@ -28,7 +28,7 @@ endif
 
 # engine modules: orchestrator + Renderer/Physics/AI/Audio/Resources/World
 SRC  := src/main.c src/render.c src/physics.c src/ai.c src/audio.c src/resource.c src/world.c src/world_instance.c src/world_resident.c src/world_mesh.c
-HDRS := src/nfsu2.h src/render.h src/physics.h src/ai.h src/audio.h src/resource.h src/debug.h src/world.h src/world_instance.h src/world_resident.h src/world_mesh.h src/world_capture_policy.h src/world_group_reader.h src/world_scenery.h src/ground_motion.h
+HDRS := src/car_config.h src/car_mod.h src/nfsu2.h src/render.h src/physics.h src/ai.h src/audio.h src/resource.h src/debug.h src/world.h src/world_instance.h src/world_resident.h src/world_mesh.h src/world_capture_policy.h src/world_group_reader.h src/world_scenery.h src/ground_motion.h
 
 .DEFAULT_GOAL := nfsu2   # keep `make` building the binary, not the generated header
 
@@ -69,7 +69,7 @@ build/%.o: $(IMGUI_DIR)/%.cpp
 build/%.o: $(IMGUI_DIR)/backends/%.cpp
 	@mkdir -p build
 	$(CXX) -O2 $(SDL_CFLAGS) -I$(IMGUI_DIR) -c $< -o $@
-build/debugui.o: src/debugui.cpp src/debug.h
+build/debugui.o: src/debugui.cpp src/debug.h src/car_config.h
 	@mkdir -p build
 	$(CXX) -O2 $(SDL_CFLAGS) -I$(IMGUI_DIR) -c src/debugui.cpp -o $@
 
@@ -86,7 +86,7 @@ world-instance-test: tools/world_instance_test.c src/world_instance.c src/physic
 	$(CC) $(CFLAGS) -DWORLD_INSTANCE_TESTING -Isrc tools/world_instance_test.c src/world_instance.c src/physics.c -o build/world_instance_test -lm
 	./build/world_instance_test
 
-car-material-test: tools/car_material_test.c src/nfsu2.h
+car-material-test: tools/car_material_test.c src/nfsu2.h src/car_config.h src/car_mod.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -Isrc tools/car_material_test.c -o build/car_material_test -lm
 	./build/car_material_test
@@ -133,6 +133,18 @@ wheel-render-test: tools/wheel_render_test.c src/render.c src/render.h src/nfsu2
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(SDL_CFLAGS) -Isrc tools/wheel_render_test.c src/render.c -o build/wheel_render_test $(SDL_LIBS) $(GL_LIBS) -lz -lm
 	./build/wheel_render_test
+
+wheel-reload-test: tools/wheel_reload_test.c $(SRC) $(HDRS) $(GEN)
+	@mkdir -p build
+	$(CC) $(CFLAGS) $(SDL_CFLAGS) -Isrc tools/wheel_reload_test.c $(filter-out src/main.c,$(SRC)) -o build/wheel_reload_test $(SDL_LIBS) $(GL_LIBS) -lz -lm
+	./build/wheel_reload_test
+
+.PHONY: wheel-reload-test
+
+body-kit-test: wheel-reload-test
+modification-test: wheel-reload-test
+.PHONY: modification-test
+.PHONY: body-kit-test
 
 light-state-test: tools/light_state_test.c src/render.c src/render.h src/nfsu2.h
 	@mkdir -p build

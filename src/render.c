@@ -415,14 +415,30 @@ static void mesh_normals(const N2Mesh *m, float *nor) {
         np[0]/=l; np[1]/=l; np[2]/=l; }
 }
 
-/* upload a scene's meshes to GPU buffers, computing per-vertex normals. */
+void free_scene_gpu(GpuMesh *gm, int count) {
+    if (!gm) return;
+    for (int i = 0; i < count; i++) {
+        glDeleteBuffers(1, &gm[i].vbo);
+        glDeleteBuffers(1, &gm[i].nbo);
+        glDeleteBuffers(1, &gm[i].ibo);
+    }
+    free(gm);
+}
+
+/* Upload meshes with per-vertex normals; allocation failure releases partial buffers. */
 GpuMesh *upload_scene(N2Scene *s) {
     GpuMesh *gm = (GpuMesh *)calloc(s->count, sizeof(GpuMesh));
+    if (!gm) return NULL;
     for (int i = 0; i < s->count; i++) {
         N2Mesh *m = &s->meshes[i];
         N2Mesh rounded={0};
         if (n2_round_wheel_tyre(m,&rounded)) m=&rounded;
         float *nor = (float *)calloc(m->nverts * 3, sizeof(float));
+        if (!nor) {
+            free(rounded.verts); free(rounded.idx);
+            free_scene_gpu(gm, s->count);
+            return NULL;
+        }
         mesh_normals(m, nor);
         glGenBuffers(1,&gm[i].vbo); glBindBuffer(GL_ARRAY_BUFFER,gm[i].vbo);
         glBufferData(GL_ARRAY_BUFFER, m->nverts*5*sizeof(float), m->verts, GL_STATIC_DRAW);
@@ -1022,7 +1038,7 @@ GLuint upload_tpk_texture_to_gpu(const N2Tex *t) {
                    : (t->dxtfmt == 5) ? GL_COMPRESSED_RGBA_S3TC_DXT5_EXT
                                       : GL_COMPRESSED_RGBA_S3TC_DXT1_EXT;
         int bpb = (t->dxtfmt == 1) ? 8 : 16;   /* S3TC block bytes (DXT3/DXT5 = 16) */
-        GLuint id; glGenTextures(1, &id); glBindTexture(GL_TEXTURE_2D, id);
+        GLuint id = 0; glGenTextures(1, &id); glBindTexture(GL_TEXTURE_2D, id);
         /* Replay every complete mip level in the blob (level 0 = base .. 1x1).
            Per-level block count matches n2_mipbytes2 exactly so the offsets line
            up. Only whole levels are uploaded; a chain that reaches 1x1 is a
@@ -1050,9 +1066,10 @@ GLuint upload_tpk_texture_to_gpu(const N2Tex *t) {
 }
 
 GLuint upload_tex(const N2Tex *t) {
-    GLuint id; glGenTextures(1, &id); glBindTexture(GL_TEXTURE_2D, id);
+    GLuint id = 0; glGenTextures(1, &id); glBindTexture(GL_TEXTURE_2D, id);
     if (t->alpha) {   /* interleave the decal-mask plane -> RGBA */
         unsigned char *px = (unsigned char *)malloc((size_t)t->w * t->h * 4);
+        if (!px) { glDeleteTextures(1, &id); return 0; }
         for (long p = 0; p < (long)t->w * t->h; p++) {
             px[p*4]=t->rgb[p*3]; px[p*4+1]=t->rgb[p*3+1];
             px[p*4+2]=t->rgb[p*3+2]; px[p*4+3]=t->alpha[p];

@@ -89,30 +89,16 @@ typedef struct {
     uint32_t car_material; /* trusted 0x134013 hash; 0 for absent/mixed/invalid data */
     long car_source; /* payload offset of the owning car object, for its attachments */
     unsigned char car_mount; /* N2_MOUNT_*; shared by every slice of a car part */
+    unsigned char car_part; /* independent modification slot + 1, or zero */
+    unsigned char car_under; /* hood underside, retained beneath replacement skins */
 } N2Mesh;
 
-/* Active customization profile.
- *
- * NOTE on how the data actually lays out, which is not the obvious model:
- * KIT00 is the WHOLE car (28-29 part families on MIATA/GOLF: body, doors,
- * roof, hood, lights, wheels, engine...). KIT01..KIT29 carry only 3-5
- * families each — front bumper, rear bumper, skirt, sometimes trunk audio.
- * So a body kit does not REPLACE the car, it OVERRIDES those few parts on
- * top of KIT00. Dropping KIT00 when a kit is selected would delete the
- * entire vehicle except its bumpers.
- * Hoods work the same way but under a STYLEnn token (there is no STYLE00 —
- * the stock hood is KIT00_HOOD), so hood_style 0 means "keep KIT00's".
- *
- * spoiler/wheel are accepted but inert: neither lives in a car's own
- * GEOMETRY.BIN. They are separate part libraries (CARS/SPOILER, CARS/WHEELS,
- * each its own GEOMETRY.BIN), so wiring them needs a second asset load, not
- * a filter over this file. Left as fields so the call sites don't churn. */
-typedef struct {
-    int body_kit;       /* 0 = stock KIT00 bumpers/skirts, N = KITnn overrides */
-    int hood_style;     /* 0 = stock KIT00 hood,           N = STYLEnn overrides */
-    int spoiler_style;  /* inert, see note */
-    int wheel_style_id; /* inert, see note */
-} N2CarConfig;
+#include "car_config.h"
+
+/* KIT00 supplies the base car; KITnn and independent STYLEnn choices replace
+ * selected families. N2CarConfig lives in car_config.h so ImGui can share it.
+ * Separate spoiler/exhaust/scoop libraries are assembled by car_mod.h after
+ * this parser selects the car-local parts. */
 
 typedef struct {
     N2Mesh *meshes;
@@ -1403,6 +1389,36 @@ static int n2_car_variant_numbers(const unsigned char *d, long len, int kind,
     return n;
 }
 
+static int n2_car_part(const char *name) {
+    if(strstr(name,"_FRONT_BUMP"))return N2_PART_FRONT;
+    if(strstr(name,"_REAR_BUMP"))return N2_PART_REAR;
+    if(strstr(name,"_SKIRT"))return N2_PART_SKIRT;
+    if(strstr(name,"_HOOD"))return N2_PART_HOOD;
+    if(strstr(name,"_HEADLIGH"))return N2_PART_HEADLIGHT;
+    if(strstr(name,"_BRAKELIG"))return N2_PART_TAILLIGHT;
+    if(strstr(name,"_ENGINE"))return N2_PART_ENGINE;
+    if(strstr(name,"_TRUNK_AUDIO"))return N2_PART_AUDIO;
+    if(strstr(name,"_EXHAUST"))return N2_PART_EXHAUST;
+    if(strstr(name,"_SPOILER"))return N2_PART_SPOILER;
+    return -1;
+}
+
+/* Car names are uppercase. The generic world-name reader also accepts
+ * lowercase and can mistake binary header bytes for a name (HUMMER KIT16). */
+static void n2_car_mesh_name(const unsigned char *d,long beg,long end,char out[64]) {
+    out[0]=0;N2Leaf leaves[4];int count=0;
+    n2_find_leaves(d,beg,end,0x00134011u,leaves,&count,4);
+    for(int k=0;k<count;k++) {
+        const unsigned char *p=d+leaves[k].off;long size=leaves[k].size;
+        for(long i=0;i+5<size;i++)if(p[i]>='A' && p[i]<='Z') {
+            long j=i;
+            while(j<size && (p[j]=='_' || (p[j]>='A'&&p[j]<='Z') || (p[j]>='0'&&p[j]<='9')))j++;
+            if(j-i>=5) {int n=j-i<63?(int)(j-i):63;memcpy(out,p+i,(size_t)n);out[n]=0;return;}
+            i=j;
+        }
+    }
+}
+
 /* Classify a car mesh against the active profile.
  * Returns 1 = skip outright. Otherwise reports the variant token and the
  * family key (name minus that token minus any _A.._D LOD suffix) so
@@ -1417,42 +1433,29 @@ static int n2_car_is_variant(const unsigned char *d, long beg, long end,
     if (out_kind) *out_kind = 0;
     if (out_num)  *out_num  = 0;
     if (out_fam)  *out_fam  = 0;
-    N2Leaf mat[4]; int nm = 0;
-    n2_find_leaves(d, beg, end, 0x00134011u, mat, &nm, 4);
-    for (int k = 0; k < nm; k++) {
-        const unsigned char *p = d + mat[k].off; long s = mat[k].size;
-        for (long i = 0; i + 5 < s; i++) {
-            if (p[i] >= 'A' && p[i] <= 'Z') {
-                long j = i;
-                while (j < s && (p[j]=='_' || (p[j]>='A'&&p[j]<='Z') || (p[j]>='0'&&p[j]<='9'))) j++;
-                if (j - i >= 5) {
-                    const unsigned char *n = p + i; long L = j - i;
-                    if (n2_contains(n,L,"KITW") ||
-                        n2_contains(n,L,"WIDE")  ||   /* widebody variants (WIDE1..4) */
-                        n2_contains(n,L,"DECAL"))     /* decal mount shells (used only
-                                                         when a sticker is applied) */
-                        return 1;
-                    int num = 0; long ta = 0, tl = 0;
-                    int kind = n2_name_variant(n, L, &num, &ta, &tl);
-                    if (kind == 1 && num != 0 && num != cfg->body_kit)   return 1;
-                    if (kind == 2 && num != cfg->hood_style)             return 1;
-                    if (out_kind) *out_kind = kind;
-                    if (out_num)  *out_num  = num;
-                    if (out_fam) {                    /* hash the name minus the token */
-                        long e = L;
-                        if (e >= 2 && n[e-2]=='_' && n[e-1]>='A' && n[e-1]<='D') e -= 2;
-                        uint32_t h = 2166136261u;
-                        for (long q = 0; q < e; q++) {
-                            if (kind && q >= ta && q < ta + tl) continue;
-                            h ^= n[q]; h *= 16777619u;
-                        }
-                        *out_fam = h ? h : 1u;
-                    }
-                    return 0;
-                }
-                i = j;
-            }
-        }
+    char name[64];n2_car_mesh_name(d,beg,end,name);
+    const unsigned char *n=(const unsigned char *)name;long L=strlen(name);
+    if(strstr(name,"KITW") || strstr(name,"WIDE") || strstr(name,"DECAL"))return 1;
+    int num=0;long ta=0,tl=0;
+    int kind=n2_name_variant(n,L,&num,&ta,&tl);
+    int part=n2_car_part(name),choice=part>=0?cfg->parts[part]:0;
+    if(choice>=1000)return 1;
+    if(choice>0) {
+        int wanted_kind=(choice-1)/100+1,wanted_num=(choice-1)%100;
+        if(kind && !(kind==1 && num==0) && (kind!=wanted_kind || num!=wanted_num))return 1;
+    } else {
+        if(kind==1 && num!=0 && num!=cfg->body_kit)return 1;
+        /* A hood choice cannot also select matching light/engine styles.
+         * Untyped libraries retain the legacy hood_style selector. */
+        if(kind==2 && (num!=cfg->hood_style || (part>=0 && part!=N2_PART_HOOD)))return 1;
+    }
+    if(out_kind)*out_kind=kind;
+    if(out_num)*out_num=num;
+    if(out_fam && L>=5) {
+        long e=L;if(e>=2 && n[e-2]=='_' && n[e-1]>='A' && n[e-1]<='D')e-=2;
+        uint32_t h=2166136261u;
+        for(long q=0;q<e;q++) {if(kind && q>=ta && q<ta+tl)continue;h^=n[q];h*=16777619u;}
+        *out_fam=h?h:1u;
     }
     return 0;
 }
@@ -1462,7 +1465,7 @@ static int n2_car_is_variant(const unsigned char *d, long beg, long end,
  * replacement families. Wherever both provide the same family, drop KIT00's.
  * Runs before the LOD collapse, so the winner still picks its best tier. */
 static void n2_car_apply_config(N2Scene *s, const N2CarConfig *cfg) {
-    if (!cfg->body_kit && !cfg->hood_style) return;   /* pure stock: nothing shadows */
+    (void)cfg; /* the parser already filtered every independent selection */
     int n = s->count;
     char *drop = (char *)calloc((size_t)(n ? n : 1), 1);
     if (!drop) return;                                /* OOM: keep everything */
@@ -1471,13 +1474,17 @@ static void n2_car_apply_config(N2Scene *s, const N2CarConfig *cfg) {
        itself), which silently skips shadowing and leaves both the stock and
        the aftermarket part drawn on top of each other. */
     for (int i = 0; i < n; i++) {
-        int sel = (s->meshes[i].vkind == 1 && s->meshes[i].vnum == cfg->body_kit
-                                           && cfg->body_kit != 0)
+        int sel = (s->meshes[i].vkind == 1 && s->meshes[i].vnum != 0)
                || (s->meshes[i].vkind == 2);
         if (!sel || !s->meshes[i].famkey) continue;
         for (int j = 0; j < n; j++)
             if (j != i && s->meshes[j].vkind == 1 && s->meshes[j].vnum == 0 &&
-                s->meshes[j].famkey == s->meshes[i].famkey)
+                (s->meshes[j].famkey == s->meshes[i].famkey ||
+                 ((s->meshes[i].car_part==N2_PART_HEADLIGHT+1 ||
+                   s->meshes[i].car_part==N2_PART_TAILLIGHT+1 ||
+                   (s->meshes[i].car_part==N2_PART_HOOD+1 &&
+                    !s->meshes[i].car_under && !s->meshes[j].car_under)) &&
+                   s->meshes[i].car_part==s->meshes[j].car_part)))
                 drop[j] = 1;
     }
     int w = 0;
@@ -1912,7 +1919,10 @@ static void n2_walk_car(const unsigned char *d, long beg, long end, N2Scene *sce
             int vkind = 0, vnum = 0; uint32_t vfam = 0;
             if (n2_car_is_variant(d, ds, ds + s, cfg, &vkind, &vnum, &vfam)) { o = ds + s; continue; }
             int cat = n2_car_category(d, ds, ds + s);
-            char part[64]; n2_mesh_name(d, ds, ds + s, part, sizeof part);
+            char part[64]; n2_car_mesh_name(d, ds, ds + s, part);
+            int part_slot=n2_car_part(part);
+            if(part_slot==N2_PART_HEADLIGHT)cat=N2_CAR_LIGHT;
+            if(part_slot==N2_PART_TAILLIGHT)cat=N2_CAR_BRAKELIGHT;
             int mount = cat == N2_CAR_TIRE ? N2_MOUNT_WHEEL : N2_MOUNT_BODY;
             if (cat != N2_CAR_BRAKELIGHT) {
                 /* FRONT_BRAKE is truncated to FRONT_BRAK on long car names. */
@@ -2016,6 +2026,8 @@ static void n2_walk_car(const unsigned char *d, long beg, long end, N2Scene *sce
                         scene->meshes[before].trim = trim;
                         scene->meshes[before].car_material = submat[k];
                         scene->meshes[before].car_source = ds;
+                        scene->meshes[before].car_part=(unsigned char)(part_slot+1);
+                        scene->meshes[before].car_under=strstr(part,"_HOOD_UNDER")!=NULL;
                         /* The dominant slice keeps the plain family key so it
                            still dedupes against LOD tiers that never split
                            (a lower tier can lack the badge slot entirely, so
@@ -2044,6 +2056,8 @@ static void n2_walk_car(const unsigned char *d, long beg, long end, N2Scene *sce
                         scene->meshes[before].trim = trim;
                         scene->meshes[before].car_material = trust_cls && nsub && !matdiffer ? submat[0] : 0;
                         scene->meshes[before].car_source = ds;
+                        scene->meshes[before].car_part=(unsigned char)(part_slot+1);
+                        scene->meshes[before].car_under=strstr(part,"_HOOD_UNDER")!=NULL;
                         scene->meshes[before].namekey = nk2;
                         scene->meshes[before].vkind = vkind;
                         scene->meshes[before].vnum = vnum;
@@ -2059,50 +2073,54 @@ static void n2_walk_car(const unsigned char *d, long beg, long end, N2Scene *sce
         o = ds + s;
     }
 }
+/* A socket is owned by a retained source object. Material slices and LOD
+ * copies may repeat it; disagreeing transforms reject the attachment. */
+static int n2_car_socket(const unsigned char *d,long len,const N2Scene *s,
+                         uint32_t key,float out[16]) {
+    int found=0;
+    for(int i=0;i<s->count;i++) {
+        long off=s->meshes[i].car_source;
+        if(off<8 || off>len)continue;
+        int seen=0;for(int j=0;j<i;j++)if(s->meshes[j].car_source==off)seen=1;
+        if(seen)continue;
+        uint32_t size=n2_u32(d+off-4);if((long)size>len-off)return -1;
+        N2Leaf leaf[4];int nl=0;n2_find_leaves(d,off,off+size,0x0013401au,leaf,&nl,4);
+        for(int l=0;l<nl;l++) {
+            const unsigned char *p=d+leaf[l].off;long bytes=leaf[l].size;
+            int pad=n2_skip_filler(p,(int)bytes);p+=pad;bytes-=pad;
+            if(bytes%80)return -1;
+            for(long at=0;at<bytes;at+=80)if(n2_u32(p+at)==key) {
+                float m[16];memcpy(m,p+at+16,sizeof m);
+                for(int a=0;a<16;a++)if(!isfinite(m[a]))return -1;
+                if(fabsf(m[3])+fabsf(m[7])+fabsf(m[11])+fabsf(m[15]-1)>1e-4f)return -1;
+                for(int a=0;a<3;a++)for(int b=a;b<3;b++) {
+                    float dot=0;for(int k=0;k<3;k++)dot+=m[a*4+k]*m[b*4+k];
+                    if(fabsf(dot-(a==b?1.f:0.f))>.002f)return -1;
+                }
+                if(found) {for(int a=0;a<16;a++)if(fabsf(out[a]-m[a])>1e-5f)return -1;}
+                else {memcpy(out,m,sizeof m);found=1;}
+            }
+        }
+    }
+    return found;
+}
+
 /* Exhaust geometry is authored with its outlet facing -X and up +Z.
  * Bumper sockets use outward +Z and up +X: source (x,y,z) -> (z,y,-x).
  * Measured on the stock source meshes and socket bases, independently of
  * exporter object pivots. Run after kit/LOD selection, once per fresh load.
  * Missing/invalid/ambiguous sockets leave the source geometry intact. */
 static int n2_car_attach_exhaust(const unsigned char *d, long len, N2Scene *s) {
-    float socket[2][16]; int have[2]={0}, ne=0;
+    float socket[2][16];
+    int have[2]={n2_car_socket(d,len,s,0xbcf8a18bu,socket[0]),
+                 n2_car_socket(d,len,s,0xbd7cf15eu,socket[1])}, ne=0;
+    if(have[0]<0 || have[1]<0)return -1;
     long exhaust_source=0;
-    for (int i=0;i<s->count;i++) {
-        long off=s->meshes[i].car_source;
-        if (off<8 || off>len) continue;
-        uint32_t size=n2_u32(d+off-4);
-        if ((long)size>len-off) return -1;
-        char name[64]; n2_mesh_name(d,off,off+size,name,sizeof name);
-        if (strstr(name,"_EXHAUST_")) {
-            if (exhaust_source && exhaust_source!=off) return -1;
-            exhaust_source=off;ne++;
-        }
-        if (!strstr(name,"_REAR_BUMP")) continue;
-        int seen=0;for(int j=0;j<i;j++)if(s->meshes[j].car_source==off)seen=1;
-        if(seen)continue; /* all material slices own the same marker leaf */
-        N2Leaf leaf[4];int nl=0;
-        n2_find_leaves(d,off,off+size,0x0013401au,leaf,&nl,4);
-        for(int l=0;l<nl;l++) {
-            const unsigned char *p=d+leaf[l].off;long bytes=leaf[l].size;
-            int pad=n2_skip_filler(p,(int)bytes);p+=pad;bytes-=pad;
-            if(bytes%80) return -1;
-            for(long at=0;at<bytes;at+=80) {
-                uint32_t key=n2_u32(p+at);
-                int side=key==0xbcf8a18bu?0:key==0xbd7cf15eu?1:-1; /* LEFT/RIGHT_EXHAUST */
-                if(side<0)continue;
-                float m[16];memcpy(m,p+at+16,sizeof m);
-                for(int a=0;a<16;a++)if(!isfinite(m[a]))return -1;
-                if(fabsf(m[3])+fabsf(m[7])+fabsf(m[11])+fabsf(m[15]-1)>1e-4f)return -1;
-                /* Accept rigid rotations/reflections, not unproven scale/shear. */
-                for(int a=0;a<3;a++)for(int b=a;b<3;b++) {
-                    float dot=0;for(int k=0;k<3;k++)dot+=m[a*4+k]*m[b*4+k];
-                    if(fabsf(dot-(a==b?1.f:0.f))>.002f)return -1;
-                }
-                if(have[side]) {
-                    for(int a=0;a<16;a++)if(fabsf(socket[side][a]-m[a])>1e-5f)return -1;
-                } else {memcpy(socket[side],m,sizeof m);have[side]=1;}
-            }
-        }
+    for(int i=0;i<s->count;i++) {
+        const N2Mesh *m=s->meshes+i;
+        if(m->car_part!=N2_PART_EXHAUST+1)continue;
+        if(exhaust_source && exhaust_source!=m->car_source)return -1;
+        exhaust_source=m->car_source;ne++;
     }
     if(!ne)return 0;
     int ns=have[0]+have[1];if(!ns)return -1;
@@ -2149,7 +2167,7 @@ failed:
 
 static int n2_load_car(const unsigned char *d, long len, N2Scene *scene,
                        const uint32_t *keys, int nkeys, const N2CarConfig *cfg) {
-    static const N2CarConfig stock = { 0, 0, 0, 0 };
+    static const N2CarConfig stock = {0};
     if (!cfg) cfg = &stock;
     memset(scene, 0, sizeof(*scene));
     n2_walk_car(d, 0, len, scene, keys, nkeys, cfg);
@@ -2195,18 +2213,20 @@ static void n2_prepare_wheel_mesh(N2Mesh *m) {
     }
 }
 
-/* GPU-only tyre refinement: two midpoint subdivisions turn the usual 20-sided
- * circumference into 80 sides. Interpolate along the axle-centred arc rather
- * than its chord. Source geometry remains the physics/profile authority.
+/* GPU-only wheel refinement: two subdivisions turn a 20-sided tyre into 80
+ * sides; three turn a seven-sided inner barrel into 56. Flat INTERIOR backing
+ * faces stay intact (the replacement annulus is already round). Interpolate
+ * along the axle-centred arc. Source geometry remains the profile authority.
  * On success the caller owns out->verts/idx; failure leaves out untouched. */
 static int n2_round_wheel_tyre(const N2Mesh *source, N2Mesh *out) {
     if (!source || !out || source==out || source->car_mount!=N2_MOUNT_WHEEL ||
-        source->car_material!=N2_MAT_RUBBER || source->vcol ||
+        (source->car_material!=N2_MAT_RUBBER && source->car_material!=N2_MAT_INTERIOR) || source->vcol ||
         !source->verts || !source->idx || source->nverts<=0 ||
         source->nidx<=0 || source->nidx%3) return 0;
     N2Mesh work=*source;
+    int interior=source->car_material==N2_MAT_INTERIOR;
     int owned=0;
-    for (int pass=0;pass<2;pass++) {
+    for (int pass=0;pass<(interior?3:2);pass++) {
         if (work.nidx>INT32_MAX/4 || work.nverts>65535-work.nidx) {
             if (owned) { free(work.verts); free(work.idx); }
             return 0;
@@ -2218,6 +2238,16 @@ static int n2_round_wheel_tyre(const N2Mesh *source, N2Mesh *out) {
         int ok=verts && idx && edges && mids, nv=work.nverts, ne=0, ni=0;
         if (ok) memcpy(verts,work.verts,(size_t)work.nverts*5*sizeof(float));
         for (int j=0;ok && j<work.nidx;j+=3) {
+            if (interior) {
+                for (int k=0;k<3;k++) if (work.idx[j+k]>=work.nverts) ok=0;
+                if (!ok) break;
+                float y=work.verts[5*work.idx[j]+1];
+                if (fabsf(y-work.verts[5*work.idx[j+1]+1])<1e-6f &&
+                    fabsf(y-work.verts[5*work.idx[j+2]+1])<1e-6f) {
+                    for (int k=0;k<3;k++) idx[ni++]=work.idx[j+k];
+                    continue;
+                }
+            }
             int mid[3];
             for (int k=0;ok && k<3;k++) {
                 int a=work.idx[j+k], b=work.idx[j+(k+1)%3];
@@ -2249,7 +2279,7 @@ static int n2_round_wheel_tyre(const N2Mesh *source, N2Mesh *out) {
         }
         free(edges); free(mids);
         if (owned) { free(work.verts); free(work.idx); }
-        if (!ok) { free(verts); free(idx); return 0; }
+        if (!ok || !ne) { free(verts); free(idx); return 0; }
         work.verts=verts; work.idx=idx; work.nverts=nv; work.nidx=ni; owned=1;
     }
     *out=work;
