@@ -8,7 +8,7 @@
  */
 #include <stdio.h>
 #include <string.h>
-#include "../src/nfsu2.h"
+#include "../src/car_mod.h"
 
 static int PASS = 0, FAIL = 0;
 static void chk(const char *what, int ok) {
@@ -826,7 +826,7 @@ static void rim_orientation_test(void) {
     const uint32_t tex[]={0x12345678},mat[]={0x22719fa9,N2_MAT_INTERIOR};
     const SubSpec sub[]={{3,0,0,0},{6,0,1,3}};
     object(&f,"TEST_STYLE02_15_23_A",tex,1,mat,2,sub,2,p,7,idx,9);
-    N2CarConfig cfg={0,2,0,2};N2Scene s;
+    N2CarConfig cfg={.hood_style=2,.wheel_style_id=2};N2Scene s;
     n2_load_car(f.b,f.n,&s,tex,1,&cfg);
     chk("library fixture retains spoke and backing slices",n2_rim_select_tier(&s)==2);
     if(s.count!=2){n2_free_scene(&s);return;}
@@ -872,7 +872,7 @@ static void rim_tier_test(void) {
     object(&f,"BBS_STYLE01_15_23_A",tex,2,NULL,0,sub,2,p,6,idx,12);
     object(&f,"BBS_STYLE01_15_23_B",tex,2,NULL,0,NULL,0,p,6,idx,3);
     object(&f,"BBS_STYLE01_16_24_A",tex,2,NULL,0,sub,2,p,6,idx,12);
-    N2CarConfig cfg={0,1,0,1}; N2Scene s;
+    N2CarConfig cfg={.hood_style=1,.wheel_style_id=1}; N2Scene s;
     n2_load_car(f.b,f.n,&s,tex,2,&cfg);
     chk("fixture has two complete models after LOD selection",s.count==4);
     uint32_t tier=s.meshes[0].tierid;
@@ -951,7 +951,7 @@ static void wheel_material_identity_test(void) {
         if(bad==1)sub[1].start=4; /* invalid partition: no trusted material */
         if(bad==2)sub[1].matid=99; /* preserve valid range, unknown identity */
         object(&f,names[name],tex,1,mat,2,sub,2,pos,3,idx,6);
-        N2CarConfig cfg={0,1,0,1};N2Scene sc;
+        N2CarConfig cfg={.hood_style=1,.wheel_style_id=1};N2Scene sc;
         n2_load_car(f.b,f.n,&sc,tex,1,&cfg);
         chk("source coverage is unchanged",total_nidx(&sc)==6);
         if(bad==1)chk("malformed partition has no trusted material",
@@ -1001,7 +1001,7 @@ static void exhaust_attachment_test(void) {
             chunk(&f,0x0013401au,&marks);
             uint32_t size=(uint32_t)(f.n-start-8);memcpy(f.b+start+4,&size,4);
         }
-        N2CarConfig cfg={kit,0,0,0};N2Scene s;
+        N2CarConfig cfg={.body_kit=kit};N2Scene s;
         n2_load_car(f.b,f.n,&s,tex,1,&cfg);
         int n=0,ok=1;
         for(int i=0;i<s.count;i++)if(s.meshes[i].car_source==source) {
@@ -1025,6 +1025,58 @@ static void exhaust_attachment_test(void) {
         chk("single/dual socket geometry count is exact",n==(mode==1?4:2));
         n2_free_scene(&s);
     }
+}
+
+static void independent_parts_test(void) {
+    Buf f={.n=0};
+    float pos[3][3]={{0,0,0},{1,0,0},{0,1,1}};
+    uint16_t idx[]={0,1,2};
+    const char *families[]={"FRONT_BUMPER","REAR_BUMPER","SKIRT","HOOD",
+                           "HEADLIGHT_LEFT","HEADLIGHT_RIGHT","BRAKELIGHT","ENGINE"};
+    for(int part=0;part<8;part++)for(int style=0;style<3;style++) {
+        char name[64];snprintf(name,sizeof name,"TEST_%s%02d_%s_A",part<3||!style?"KIT":"STYLE",style,families[part]);
+        if(part==3 && style==2) {
+            object(&f,"TEST_STYLE02_HOOD_LEFT_A",NULL,0,NULL,0,NULL,0,pos,3,idx,3);
+            object(&f,"TEST_STYLE02_HOOD_RIGHT_A",NULL,0,NULL,0,NULL,0,pos,3,idx,3);
+            continue;
+        }
+        object(&f,name,NULL,0,NULL,0,NULL,0,pos,3,idx,3);
+    }
+    N2CarConfig cfg={.body_kit=2};
+    cfg.parts[N2_PART_FRONT]=2; /* KIT01, leaving rear/skirt on KIT02 */
+    cfg.parts[N2_PART_HOOD]=103;cfg.parts[N2_PART_HEADLIGHT]=102;
+    N2Scene s={0};n2_load_car(f.b,f.n,&s,NULL,0,&cfg);
+    int count[N2_PART_COUNT]={0},ok=1;
+    for(int i=0;i<s.count;i++) {
+        N2Mesh *m=s.meshes+i;int p=m->car_part-1;
+        if(p<0)continue;
+        count[p]++;
+        int expected=p==N2_PART_FRONT||p==N2_PART_HEADLIGHT?1:
+                     p==N2_PART_REAR||p==N2_PART_SKIRT||p==N2_PART_HOOD?2:0;
+        ok &= m->vnum==expected;
+    }
+    chk("independent front/rear/skirt/hood/lights keep their selected variants",ok);
+    chk("changing headlights keeps both sides without duplicate stock lenses",count[N2_PART_HEADLIGHT]==2);
+    chk("hood style does not select matching engine or taillight styles",count[N2_PART_ENGINE]==1 && count[N2_PART_TAILLIGHT]==1);
+    chk("split hood replaces the whole stock skin without stacking",count[N2_PART_HOOD]==2 && s.count==9);
+    n2_free_scene(&s);
+    cfg.parts[N2_PART_FRONT]=1;
+    n2_load_car(f.b,f.n,&s,NULL,0,&cfg);ok=1;
+    for(int i=0;i<s.count;i++)if(s.meshes[i].car_part==N2_PART_FRONT+1)ok &= s.meshes[i].vnum==0;
+    chk("stock front bumper overrides a non-stock kit preset",ok);
+    n2_free_scene(&s);
+    Buf names={.n=0},payload={.n=0};
+    bstr(&payload,"NdTAd");bstr(&payload,"TEST_KIT16_REAR_BUMPER_A");bu32(&payload,0);
+    chunk(&names,0x00134011u,&payload);
+    char name[64];n2_car_mesh_name(names.b,0,names.n,name);
+    chk("car names ignore mixed-case binary header runs",!strcmp(name,"TEST_KIT16_REAR_BUMPER_A"));
+    chk("truncated long-car light names keep their modification slots",
+        n2_car_part("LANCEREVO8_STYLE01_HEADLIGH")==N2_PART_HEADLIGHT &&
+        n2_car_part("LANCEREVO8_STYLE01_BRAKELIG")==N2_PART_TAILLIGHT);
+    Buf empty={.n=0},entry={.n=0};leaf_name(&entry,"TEST_KIT12_REAR_BUMPER_A");chunk(&empty,0x80134010u,&entry);
+    static N2PartMenu menus[N2_PART_COUNT];
+    n2_mod_catalog_walk(empty.b,0,empty.n,0,menus);
+    chk("named placeholders without geometry are not offered",menus[N2_PART_REAR].count==0);
 }
 
 static void wheel_tyre_rounding_test(void) {
@@ -1065,14 +1117,48 @@ static void wheel_tyre_rounding_test(void) {
         !memcmp(saved,verts,sizeof saved) && !memcmp(bb,after,sizeof bb) &&
         source.nidx==6 && source.nverts==4 && source.idx==idx && source.verts==verts);
     free(rounded.verts);free(rounded.idx);memset(&rounded,0,sizeof rounded);
-    source.car_material=N2_MAT_INTERIOR;
-    chk("backing and brake opening are not subdivided",!n2_round_wheel_tyre(&source,&rounded));
+    source.car_material=N2_MAT_MAGSILVER;
+    chk("rim spokes are not rounded into a barrel",!n2_round_wheel_tyre(&source,&rounded));
     source.car_material=N2_MAT_RUBBER;source.car_mount=N2_MOUNT_BODY;
     chk("non-wheel rubber is unchanged",!n2_round_wheel_tyre(&source,&rounded));
     source.car_mount=N2_MOUNT_WHEEL;idx[0]=99;
     chk("invalid indices fall back without output allocation",!n2_round_wheel_tyre(&source,&rounded) && !rounded.verts);
     idx[0]=0;verts[0]=0;
     chk("axis-crossing geometry is preserved",!n2_round_wheel_tyre(&source,&rounded));
+
+    /* One side of a seven-sided barrel, plus a separate flat backing slice. */
+    float a=2*3.14159265f/7;
+    float inside[]={1,-.2f,0,0,0, cosf(a),-.2f,sinf(a),1,0,
+                    cosf(a),.2f,sinf(a),1,1, 1,.2f,0,0,1,
+                    1,-.2f,0,0,0, 1.2f,-.2f,0,1,0,
+                    1.2f*cosf(angle),-.2f,1.2f*sinf(angle),1,1,
+                    cosf(angle),-.2f,sinf(angle),0,1};
+    uint16_t faces[]={0,1,2,0,2,3,4,5,6,4,6,7};
+    float saved_inside[40];memcpy(saved_inside,inside,sizeof inside);
+    source.verts=inside;source.idx=faces;source.nverts=8;source.nidx=12;
+    source.car_material=N2_MAT_INTERIOR;
+    chk("seven-sided inner barrel is refined",n2_round_wheel_tyre(&source,&rounded));
+    if(!rounded.verts)return;
+    int wall=1;
+    for(int j=0;j<rounded.nidx-6;j+=3)for(int k=0;k<3;k++){
+        const float*p=rounded.verts+5*rounded.idx[j+k],*q=rounded.verts+5*rounded.idx[j+(k+1)%3];
+        wall &= fabsf(hypotf(p[0],p[2])-1)<1e-6f && p[1]>=-.200001f && p[1]<=.200001f;
+        wall &= fabsf(atan2f(p[0]*q[2]-p[2]*q[0],p[0]*q[0]+p[2]*q[2]))<=a/8+1e-6f;
+        wall &= fabsf(atan2f(p[2],p[0])/a-p[3])<1e-5f;
+    }
+    chk("inner barrel reaches 56 sides without shrinking the brake opening",wall && rounded.nidx==390);
+    chk("flat backing faces and their UVs remain byte-identical",
+        !memcmp(rounded.idx+rounded.nidx-6,faces+6,6*sizeof(uint16_t)) &&
+        !memcmp(rounded.verts+20,inside+20,20*sizeof(float)));
+    chk("barrel refinement leaves CPU source geometry unchanged",
+        !memcmp(inside,saved_inside,sizeof inside) && source.nverts==8 && source.nidx==12);
+    free(rounded.verts);free(rounded.idx);memset(&rounded,0,sizeof rounded);
+    source.car_mount=N2_MOUNT_BODY;
+    chk("cabin interior is excluded from barrel refinement",!n2_round_wheel_tyre(&source,&rounded));
+    source.car_mount=N2_MOUNT_FRONT_BRAKE;
+    chk("brake geometry is excluded from barrel refinement",!n2_round_wheel_tyre(&source,&rounded));
+    source.car_mount=N2_MOUNT_WHEEL;source.idx=faces+6;source.nidx=6;
+    chk("flat-only backings need no refinement",!n2_round_wheel_tyre(&source,&rounded));
 }
 
 static void wheel_backing_opening_test(void) {
@@ -1149,6 +1235,7 @@ int main(void) {
     wheel_tyre_rounding_test();
     wheel_backing_opening_test();
     exhaust_attachment_test();
+    independent_parts_test();
     wheel_material_identity_test();
     car_texture_alpha_test();
     rim_tier_test();

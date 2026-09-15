@@ -108,6 +108,7 @@ void mat_lookat(const float *eye, const float *fwd, float *m);   /* up = world +
 /* ---- GPU objects ---- */
 RProg    render_program(void);          /* compile+link the shader, fetch uniforms */
 GpuMesh *upload_scene(N2Scene *s);      /* VBO/NBO/IBO per mesh, normals computed */
+void free_scene_gpu(GpuMesh *gm, int count);
 GpuMesh  make_wheel(float R, float halfW);  /* procedural tyre (see render.c) */
 GLuint   make_wheel_tex(void);          /* radial alloy-rim texture for it */
 GpuMesh  make_quad(void);               /* unit quad for HUD / billboards */

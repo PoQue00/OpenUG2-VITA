@@ -1,22 +1,30 @@
 # Vehicle customization and in-place switching
 
-Requested shop layout and proposed implementation contract, 2026-09-10.
-**Not implemented yet.** This changes the intended design, not the current
-runtime. Complete the wheel/material/attachment audit before enabling new
-modification controls. See [vehicle rendering status](VEHICLE_RENDERING.md).
+Status updated 2026-09-15. The development checkout now implements independent
+visual-part replacement, failure-safe rim/kit replacement and coloured shop
+subtabs in ImGui. Full vehicle switching, persistent ownership, purchases,
+career unlocks and in-world shop access are still unimplemented. Visual acceptance
+is pending user testing; no gameplay capture was made for this change.
+
+The requested story, progression tables and shop access contract are collected
+in [GAME_FLOW.md](GAME_FLOW.md). That reference separates sourced retail behavior
+from OpenUG2 requirements and unresolved data mappings.
 
 ## One modification surface
 
-Add a **Modification** tab to the existing movable ImGui inspector. Its
+The **Modification** tab has been added to the existing movable ImGui inspector. Its
 subtabs represent Underground 2 shops; they are diagnostic controls, not a
 replacement for the later asset-backed retail-style frontend.
 
 | Subtab | Responsibilities |
 | --- | --- |
-| Body Shop | Front/rear bumpers, skirts, full body kits, hoods, spoilers, mirrors, headlight/taillight assemblies, exhaust tips and physical rim selection/size |
-| Performance Shop | Engine/ECU, intake/fuel/exhaust performance, transmission, turbo, nitrous installation, suspension, brakes, tyre grip/compound and weight upgrades; physical tyre upgrades are separate from visual rim selection |
+| Body Shop (green) | Front/rear bumpers, skirts, full body kits, hoods, spoilers, mirrors, headlight/taillight assemblies, exhaust tips and physical rim selection/size |
+| Performance Shop (blue) | Engine/ECU, intake/fuel/exhaust performance, transmission, turbo, nitrous installation, suspension, brakes, tyre grip/compound and weight upgrades; physical tyre upgrades are separate from visual rim selection |
 | Graphics / Color Shop (red) | Body/rim/part paint where supported, finish, vinyl layers and decals; rim paint must not recolour tyre rubber or backing geometry |
 | Car Specialties Shop (yellow) | Neon, window tint, custom gauges, nitrous purge visuals, hydraulics, doors/split hoods, spinners and trunk audio, as their asset/mechanic support is established |
+
+The purple Safe House currently shows installed part choices only. Owned-item
+swap/remove/refit is specified in GAME_FLOW.md and awaits inventory/save support.
 
 The yellow location is **Car Specialties Shop** and the red location is
 **Graphics Shop**, not Underground 1 categories. Shop identification and
@@ -26,20 +34,21 @@ The [Underground 2 PC manual, printed pp. 4–5](https://oldgamesdownload.com/wp
 also describes visual/performance upgrades and four reorderable vinyl layers.
 These sources describe game behavior; they are not implementation code.
 
-Keep the active-car selector and selection/status/preview controls above the
-shop subtabs. Every available player car uses this same surface, with options
+The active-car selector is above the
+shop subtabs. It currently restarts the session. Every available player car uses
+this same surface, with options
 derived from its asset inventory. Missing parts are unavailable, not silently
-substituted from another car. Retain each car's chosen configuration when
+substituted from another car. Future in-place switching must retain each car's chosen configuration when
 switching away and back; session-local storage is the first boundary. Disk
 save format, money, unlocks and purchase/refund rules remain later mechanics,
 not guessed behavior in a debug menu.
 
-Move existing modification controls here rather than duplicating independent
-state in Vehicle & Wheels and Lighting. Keep renderer/physics inspection
-sliders clearly separate from installed upgrades. Performance controls must
+Paint/rim paint and clear-coat controls now live in Graphics; neon and trunk
+audio live in Specialties. Wheel placement, handling scalars and engine-cover
+mesh inspection live in Vehicle Diagnostics. Performance controls must
 not pretend prototype handling scalars are decoded retail performance parts.
 
-## Vehicle switch must not restart the world
+## Future vehicle switch must not restart the world
 
 Car selection will replace the **active vehicle bundle**, not call `relaunch`.
 "Model only" means vehicle-specific geometry, materials, textures, attachments,
@@ -82,36 +91,33 @@ the old data. Do not stop/reinitialize the whole game to avoid ownership work.
 - `src/main.c::relaunch`: currently uses `SDL_Quit`/`execvp` for both car and
   track changes. Replace the **two car callers** (arrow selection and ImGui),
   not track switching as an unrelated expansion.
-- `src/main.c::load_rim_style`: shared startup/W/ImGui path; currently frees
-  the old geometry before parsing. Make replacement transactional when reused
-  for the modification surface.
-- The K-key kit reload is not a complete vehicle loader: it rebuilds meshes
-  but does not recompute every texture/profile/light/attachment dependent.
-  Extract one complete vehicle load/validate/release path instead of copying
-  that incomplete reload into four tabs.
+- `src/main.c::load_rim_style`: shared startup/F6/ImGui path now stages
+  geometry, diffuse texture and GPU uploads; failures retain the old wheels.
+- `prepare_body_kit` and the K/ImGui request path now validate and stage complete
+  visual candidates, including independent local parts and socket attachments,
+  texture additions, bounds and light anchors. They preserve the world, factory
+  handling, wheel anchors and engine audio. This is not whole-vehicle switching.
 - `n2_load_car`, `n2_car_variant_numbers`, `n2_car_prepare_wheels`,
   `n2_car_profile`, `wheel_config_for`, `phys_vehicle_from_geometry` and
   `upload_scene` already supply the relevant parsing/preparation/profile steps.
-  The current `N2CarConfig` is not yet a per-part shop configuration: one KIT
-  and STYLE cannot independently express all bumpers, lights and decals.
+  `src/car_config.h` now carries independent visual-part selections;
+  `src/car_mod.h` discovers compatible drawable options and assembles libraries.
+  Decals, material finishes and performance packages are not part of it yet.
 - `audio_load_ginsu_sweeps`/`audio_load_engine_bank` and their callback ownership
   must be addressed explicitly. There is no existing public hot-swap API.
 
-## Delivery order and acceptance
+## Remaining delivery order and acceptance
 
-1. Finish wheel orientation/material and exhaust-attachment attribution, then
-   establish a complete vehicle-owned resource boundary with failure-safe load.
-2. Replace car-relaunch callers with in-place switching. Exercise small/large
-   cars, missing/corrupt candidates, repeated switches and return-to-prior-car.
-3. Add Modification/shop subtabs using the existing ImGui pattern; migrate
-   working controls and mark unsupported inventory/mechanics honestly.
-4. Expand per-part configuration and mechanics one proven asset family at a
-   time. All car presets use the same path; do not add per-car UI forks.
+The user's latest priority put independent parts and shop organization before
+whole-vehicle hot switching. Both now exist as debug previews. Next implement
+purchase/ownership/save and shop-entry gates according to GAME_FLOW.md, while
+preserving the existing prepare/validate/commit failure behavior. Whole-vehicle
+switching still needs the resource and audio boundary described above.
 
-Acceptance requires unchanged world-load counters and resource identities,
-unchanged session/route/pose on success or failure, no growing GPU/CPU/audio
-resource count across repeated switches, no callback races, and correct body/
-wheel/attachment/profile matching. Verify wheel-only views plus low-resolution
-whole-car placement, both hub mirrors, and a live paused-world switch. Keep the
-normal 1920x1080 default. Document timing and remaining unsupported mechanics;
-do not call a mesh-only preview a successful gameplay hot swap.
+Validation completed: 276 material assertions, rollback at 11 failure boundaries,
+all 44 catalog cars through kit cycling, and 9,312 independent choices across the
+29 cars with options, including mixed assemblies and stock restoration. These
+are CPU/ASan/UBSan checks with simulated GPU ownership, not visual acceptance.
+Normal/debug builds pass. Keep actual gameplay and asset attachment appearance
+pending until manually tested; never mark an undecoded career mechanic complete
+because a debug selector exists.
